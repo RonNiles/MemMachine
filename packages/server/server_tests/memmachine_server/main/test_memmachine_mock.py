@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
@@ -34,6 +34,7 @@ from memmachine_server.common.session_manager.session_data_manager import (
 from memmachine_server.episodic_memory import EpisodicMemory
 from memmachine_server.main.memmachine import MemMachine, MemoryType
 from memmachine_server.retrieval_agent.common.agent_api import AgentToolBase
+from memmachine_server.semantic_memory.semantic_memory import SemanticService
 from memmachine_server.semantic_memory.semantic_model import SemanticFeature
 
 
@@ -931,3 +932,227 @@ async def test_start_deletes_marked_sessions(minimal_conf, patched_resource_mana
     )
 
     session_manager.delete_session.assert_awaited_once_with(session_key=session_key)
+
+
+# ---------------------------------------------------------------------------
+# MemMachine.ingestion_status
+# ---------------------------------------------------------------------------
+
+
+def _make_thresholds(
+    *,
+    min_messages: int = 5,
+    max_age_seconds: float = 300.0,
+    consolidation_threshold: int = 20,
+    poll_interval_seconds: float = 2.0,
+    max_features_per_update: int = 50,
+) -> SemanticService.IngestionThresholds:
+    return SemanticService.IngestionThresholds(
+        min_messages_to_process=min_messages,
+        max_pending_age_seconds=max_age_seconds,
+        consolidation_threshold=consolidation_threshold,
+        poll_interval_seconds=poll_interval_seconds,
+        max_features_per_update=max_features_per_update,
+    )
+
+
+def _patch_semantic_session(patched_resource_manager, *, thresholds, raw_statuses):
+    """Wire a mocked semantic session manager onto the resource manager."""
+    semantic_session = MagicMock()
+    semantic_session.get_ingestion_thresholds = MagicMock(return_value=thresholds)
+
+    async def _list_ingestion_statuses(*, session_data, set_metadata):
+        for status in raw_statuses:
+            yield status
+
+    semantic_session.list_ingestion_statuses = _list_ingestion_statuses
+    patched_resource_manager.get_semantic_session_manager = AsyncMock(
+        return_value=semantic_session
+    )
+    return semantic_session
+
+
+@pytest.mark.asyncio
+async def test_ingestion_status_reports_thresholds(
+    minimal_conf, patched_resource_manager
+):
+    thresholds = _make_thresholds()
+    _patch_semantic_session(
+        patched_resource_manager, thresholds=thresholds, raw_statuses=[]
+    )
+    memmachine = MemMachine(minimal_conf, patched_resource_manager)
+
+    result = await memmachine.ingestion_status(DummySessionData("s1"))
+
+    assert result.thresholds.min_messages_to_process == 5
+    assert result.thresholds.max_pending_age_seconds == 300.0
+    assert result.thresholds.consolidation_threshold == 20
+    assert result.thresholds.poll_interval_seconds == 2.0
+    assert result.thresholds.max_features_per_update == 50
+    assert result.sessions == []
+
+
+@pytest.mark.asyncio
+async def test_ingestion_status_count_threshold_triggers_ready(
+    minimal_conf, patched_resource_manager
+):
+    thresholds = _make_thresholds(min_messages=5)
+    # Old pending message but still under count; ready via age would also trigger.
+    # Use a fresh timestamp to isolate the count-threshold path.
+    fresh = datetime.now(tz=UTC)
+    raw = SemanticService.SetIngestionStatus(
+        set_id="setA",
+        pending_message_count=5,
+        oldest_pending_at=fresh,
+        category_counts={},
+    )
+    _patch_semantic_session(
+        patched_resource_manager, thresholds=thresholds, raw_statuses=[raw]
+    )
+    memmachine = MemMachine(minimal_conf, patched_resource_manager)
+
+    result = await memmachine.ingestion_status(DummySessionData("s1"))
+
+    assert len(result.sessions) == 1
+    session = result.sessions[0]
+    assert session.set_id == "setA"
+    assert session.pending_message_count == 5
+    assert session.ready_to_process is True
+    assert session.messages_until_count_threshold == 0
+
+
+@pytest.mark.asyncio
+async def test_ingestion_status_count_below_threshold_not_ready(
+    minimal_conf, patched_resource_manager
+):
+    thresholds = _make_thresholds(min_messages=5, max_age_seconds=300.0)
+    fresh = datetime.now(tz=UTC)
+    raw = SemanticService.SetIngestionStatus(
+        set_id="setA",
+        pending_message_count=2,
+        oldest_pending_at=fresh,
+        category_counts={},
+    )
+    _patch_semantic_session(
+        patched_resource_manager, thresholds=thresholds, raw_statuses=[raw]
+    )
+    memmachine = MemMachine(minimal_conf, patched_resource_manager)
+
+    result = await memmachine.ingestion_status(DummySessionData("s1"))
+
+    session = result.sessions[0]
+    assert session.ready_to_process is False
+    assert session.messages_until_count_threshold == 3
+    assert session.oldest_pending_age_seconds is not None
+    assert session.seconds_until_age_threshold is not None
+    assert session.seconds_until_age_threshold > 0
+
+
+@pytest.mark.asyncio
+async def test_ingestion_status_age_threshold_triggers_ready(
+    minimal_conf, patched_resource_manager
+):
+    thresholds = _make_thresholds(min_messages=5, max_age_seconds=60.0)
+    # Pending message older than the age threshold; below count threshold.
+    old = datetime.now(tz=UTC) - timedelta(seconds=120)
+    raw = SemanticService.SetIngestionStatus(
+        set_id="setA",
+        pending_message_count=1,
+        oldest_pending_at=old,
+        category_counts={},
+    )
+    _patch_semantic_session(
+        patched_resource_manager, thresholds=thresholds, raw_statuses=[raw]
+    )
+    memmachine = MemMachine(minimal_conf, patched_resource_manager)
+
+    result = await memmachine.ingestion_status(DummySessionData("s1"))
+
+    session = result.sessions[0]
+    assert session.ready_to_process is True
+    assert session.seconds_until_age_threshold == 0.0
+
+
+@pytest.mark.asyncio
+async def test_ingestion_status_no_pending_returns_null_age(
+    minimal_conf, patched_resource_manager
+):
+    thresholds = _make_thresholds()
+    raw = SemanticService.SetIngestionStatus(
+        set_id="setA",
+        pending_message_count=0,
+        oldest_pending_at=None,
+        category_counts={},
+    )
+    _patch_semantic_session(
+        patched_resource_manager, thresholds=thresholds, raw_statuses=[raw]
+    )
+    memmachine = MemMachine(minimal_conf, patched_resource_manager)
+
+    result = await memmachine.ingestion_status(DummySessionData("s1"))
+
+    session = result.sessions[0]
+    assert session.oldest_pending_at is None
+    assert session.oldest_pending_age_seconds is None
+    assert session.seconds_until_age_threshold is None
+    assert session.ready_to_process is False
+    assert session.messages_until_count_threshold == 5
+
+
+@pytest.mark.asyncio
+async def test_ingestion_status_categories_compute_consolidation_delta(
+    minimal_conf, patched_resource_manager
+):
+    thresholds = _make_thresholds(consolidation_threshold=20)
+    fresh = datetime.now(tz=UTC)
+    raw = SemanticService.SetIngestionStatus(
+        set_id="setA",
+        pending_message_count=1,
+        oldest_pending_at=fresh,
+        category_counts={"profile": 5, "interests": 25},
+    )
+    _patch_semantic_session(
+        patched_resource_manager, thresholds=thresholds, raw_statuses=[raw]
+    )
+    memmachine = MemMachine(minimal_conf, patched_resource_manager)
+
+    result = await memmachine.ingestion_status(DummySessionData("s1"))
+
+    categories = {c.category: c for c in result.sessions[0].categories}
+    assert categories["profile"].feature_count == 5
+    assert categories["profile"].features_until_consolidation == 15
+    assert categories["interests"].feature_count == 25
+    assert categories["interests"].features_until_consolidation == 0
+
+
+@pytest.mark.asyncio
+async def test_ingestion_status_forwards_set_metadata_to_session(
+    minimal_conf, patched_resource_manager
+):
+    """set_metadata passes through unmodified to the session manager call."""
+    thresholds = _make_thresholds()
+    captured: dict = {}
+
+    semantic_session = MagicMock()
+    semantic_session.get_ingestion_thresholds = MagicMock(return_value=thresholds)
+
+    async def _list_ingestion_statuses(*, session_data, set_metadata):
+        captured["session_data"] = session_data
+        captured["set_metadata"] = set_metadata
+        for _ in ():
+            yield None
+
+    semantic_session.list_ingestion_statuses = _list_ingestion_statuses
+    patched_resource_manager.get_semantic_session_manager = AsyncMock(
+        return_value=semantic_session
+    )
+    memmachine = MemMachine(minimal_conf, patched_resource_manager)
+    session_data = DummySessionData("s1")
+
+    await memmachine.ingestion_status(
+        session_data,
+        set_metadata={"producer_id": "u1"},
+    )
+
+    assert captured["session_data"] is session_data
+    assert captured["set_metadata"] == {"producer_id": "u1"}

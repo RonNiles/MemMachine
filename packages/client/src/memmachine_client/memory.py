@@ -369,6 +369,7 @@ class Memory:
         *,
         set_metadata: dict[str, JsonValue] | None = None,
         agent_mode: bool = False,
+        load_citations: bool = False,
     ) -> SearchResult:
         """
         Search for memories.
@@ -391,6 +392,7 @@ class Memory:
             timeout: Request timeout in seconds (uses client default if not provided)
             set_metadata: Optional metadata key-value pairs used to select semantic sets.
             agent_mode: Whether to enable top-level retrieval-agent orchestration.
+            load_citations: Whether to load source episode IDs for semantic results.
 
         Returns:
             SearchResult object containing search results from both episodic and semantic memory
@@ -427,6 +429,7 @@ class Memory:
             expand_context=expand_context,
             score_threshold=score_threshold,
             agent_mode=agent_mode,
+            load_citations=load_citations,
             filter=filter_str,
             set_metadata=set_metadata,
             types=[MemoryType.Episodic, MemoryType.Semantic],  # Search both types

@@ -12,6 +12,7 @@ import contextlib
 import logging
 from asyncio import Task
 from collections.abc import AsyncIterator, Callable, Mapping, MutableMapping, Sequence
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol, runtime_checkable
 
@@ -280,6 +281,66 @@ class SemanticService:
             set_ids=set_ids,
             is_ingested=False,
         )
+
+    @dataclass(frozen=True, slots=True)
+    class IngestionThresholds:
+        """Configured timing/size thresholds for semantic ingestion."""
+
+        min_messages_to_process: int
+        max_pending_age_seconds: float
+        consolidation_threshold: int
+        poll_interval_seconds: float
+        max_features_per_update: int
+
+    @dataclass(frozen=True, slots=True)
+    class SetIngestionStatus:
+        """Raw per-set ingestion state, prior to delta computation."""
+
+        set_id: SetIdT
+        pending_message_count: int
+        oldest_pending_at: datetime | None
+        category_counts: Mapping[str, int] = field(default_factory=dict)
+
+    def get_ingestion_thresholds(self) -> "SemanticService.IngestionThresholds":
+        """Return the ingestion thresholds currently in effect for this service."""
+        return SemanticService.IngestionThresholds(
+            min_messages_to_process=self._feature_update_message_limit,
+            max_pending_age_seconds=self._feature_time_limit.total_seconds(),
+            consolidation_threshold=self._consolidation_threshold,
+            poll_interval_seconds=self._background_ingestion_interval_sec,
+            max_features_per_update=self._max_features_per_update,
+        )
+
+    async def get_set_ingestion_status(
+        self,
+        set_id: SetIdT,
+    ) -> "SemanticService.SetIngestionStatus":
+        """Fetch pending count, oldest pending timestamp, and category counts."""
+        pending_count, oldest_at, category_counts = await asyncio.gather(
+            self._semantic_storage.get_history_messages_count(
+                set_ids=[set_id],
+                is_ingested=False,
+            ),
+            self._semantic_storage.get_oldest_pending_history_at(set_id),
+            self._semantic_storage.get_feature_counts_by_category(set_id),
+        )
+        return SemanticService.SetIngestionStatus(
+            set_id=set_id,
+            pending_message_count=pending_count,
+            oldest_pending_at=oldest_at,
+            category_counts=category_counts,
+        )
+
+    async def list_pending_set_ids_starts_with(
+        self,
+        prefix: str,
+    ) -> AsyncIterator[SetIdT]:
+        """Yield set_ids under the given prefix that have any pending messages."""
+        async for set_id in self._semantic_storage.get_history_set_ids(
+            min_uningested_messages=1,
+        ):
+            if set_id.startswith(prefix):
+                yield set_id
 
     async def add_new_feature(
         self,

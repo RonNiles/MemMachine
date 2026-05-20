@@ -2,6 +2,7 @@
 
 import logging
 from collections.abc import AsyncIterator, Mapping, MutableMapping, Sequence
+from datetime import datetime
 from pathlib import Path
 from typing import Any, cast, overload
 
@@ -788,3 +789,28 @@ class SqlAlchemyPgVectorSemanticStorage(SemanticStorage):
             result = await session.stream(stmt)
             async for set_id in result.scalars():
                 yield SetIdT(set_id)
+
+    async def get_oldest_pending_history_at(
+        self,
+        set_id: SetIdT,
+    ) -> datetime | None:
+        stmt = select(func.min(SetIngestedHistory.created_at)).where(
+            SetIngestedHistory.set_id == set_id,
+            SetIngestedHistory.ingested.is_(False),
+        )
+        async with self._create_session() as session:
+            result = await session.execute(stmt)
+            return result.scalar_one_or_none()
+
+    async def get_feature_counts_by_category(
+        self,
+        set_id: SetIdT,
+    ) -> Mapping[str, int]:
+        stmt = (
+            select(Feature.semantic_category_id, func.count(Feature.id))
+            .where(Feature.set_id == set_id)
+            .group_by(Feature.semantic_category_id)
+        )
+        async with self._create_session() as session:
+            result = await session.execute(stmt)
+            return {category: int(count) for category, count in result.all()}

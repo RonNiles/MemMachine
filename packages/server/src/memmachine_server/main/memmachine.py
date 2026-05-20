@@ -5,9 +5,16 @@ import contextlib
 import logging
 from asyncio import Task
 from collections.abc import Callable, Coroutine, Iterable, Mapping
+from datetime import UTC, datetime
 from typing import Any, Final, Protocol
 
 from memmachine_common.api import MemoryType
+from memmachine_common.api.spec import (
+    CategoryConsolidationStatus,
+    IngestionStatusResult,
+    IngestionThresholds,
+    SessionIngestionStatus,
+)
 from pydantic import BaseModel, InstanceOf, JsonValue, ValidationError
 
 from memmachine_server.common.configuration import Configuration
@@ -926,6 +933,7 @@ class MemMachine:
         score_threshold: float = -float("inf"),
         search_filter: str | None = None,
         agent_mode: bool = False,
+        load_citations: bool = False,
     ) -> SearchResponse:
         """
         Search across enabled memory types using a query string.
@@ -940,6 +948,7 @@ class MemMachine:
             search_filter: Optional filter string applied to each memory query.
             score_threshold: Optional minimum score threshold for results.
             agent_mode: Whether to enable top-level retrieval-agent orchestration.
+            load_citations: Whether to load source episode IDs for semantic results.
 
         Returns:
             Aggregated search results across memory types.
@@ -974,6 +983,7 @@ class MemMachine:
                         session_data=session_data,
                         set_metadata=set_metadata,
                         limit=limit,
+                        load_citations=load_citations,
                         search_filter=property_filter,
                     )
                 ]
@@ -983,6 +993,94 @@ class MemMachine:
         return MemMachine.SearchResponse(
             episodic_memory=await episodic_task if episodic_task else None,
             semantic_memory=await semantic_task if semantic_task else None,
+        )
+
+    async def ingestion_status(
+        self,
+        session_data: InstanceOf[SessionData],
+        *,
+        set_metadata: Mapping[str, JsonValue] | None = None,
+    ) -> IngestionStatusResult:
+        """
+        Report the state of the semantic-memory ingestion pipeline.
+
+        Args:
+            session_data: Session context (org/project) used to scope the report.
+            set_metadata: Optional metadata tags used to select specific semantic
+                sets. When omitted, every set under the org/project that has at
+                least one pending message is reported.
+
+        Returns:
+            IngestionStatusResult with live thresholds plus per-set pending
+            counts, ages, and consolidation progress.
+
+        """
+        semantic_session = await self._resources.get_semantic_session_manager()
+        raw_thresholds = semantic_session.get_ingestion_thresholds()
+        thresholds = IngestionThresholds(
+            min_messages_to_process=raw_thresholds.min_messages_to_process,
+            max_pending_age_seconds=raw_thresholds.max_pending_age_seconds,
+            consolidation_threshold=raw_thresholds.consolidation_threshold,
+            poll_interval_seconds=raw_thresholds.poll_interval_seconds,
+            max_features_per_update=raw_thresholds.max_features_per_update,
+        )
+        now = datetime.now(tz=UTC)
+        sessions: list[SessionIngestionStatus] = []
+        async for raw in semantic_session.list_ingestion_statuses(
+            session_data=session_data,
+            set_metadata=set_metadata,
+        ):
+            oldest_at = raw.oldest_pending_at
+            age_seconds: float | None
+            secs_until_age: float | None
+            if oldest_at is not None:
+                age_seconds = (now - oldest_at).total_seconds()
+                secs_until_age = max(
+                    0.0,
+                    raw_thresholds.max_pending_age_seconds - age_seconds,
+                )
+            else:
+                age_seconds = None
+                secs_until_age = None
+            ready = (
+                raw.pending_message_count >= raw_thresholds.min_messages_to_process
+                or (
+                    age_seconds is not None
+                    and age_seconds >= raw_thresholds.max_pending_age_seconds
+                )
+            )
+            categories = [
+                CategoryConsolidationStatus(
+                    category=category,
+                    feature_count=count,
+                    consolidation_threshold=raw_thresholds.consolidation_threshold,
+                    features_until_consolidation=max(
+                        0,
+                        raw_thresholds.consolidation_threshold - count,
+                    ),
+                )
+                for category, count in sorted(raw.category_counts.items())
+            ]
+            sessions.append(
+                SessionIngestionStatus(
+                    set_id=raw.set_id,
+                    pending_message_count=raw.pending_message_count,
+                    oldest_pending_at=oldest_at,
+                    oldest_pending_age_seconds=age_seconds,
+                    ready_to_process=ready,
+                    messages_until_count_threshold=max(
+                        0,
+                        raw_thresholds.min_messages_to_process
+                        - raw.pending_message_count,
+                    ),
+                    seconds_until_age_threshold=secs_until_age,
+                    categories=categories,
+                )
+            )
+        return IngestionStatusResult(
+            status=0,
+            thresholds=thresholds,
+            sessions=sessions,
         )
 
     class ListResults(BaseModel):

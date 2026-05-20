@@ -41,6 +41,8 @@ from memmachine_common.api.spec import (
     GetSemanticSetIdResponse,
     GetSemanticSetIdSpec,
     GetShortTermMemoryConfigSpec,
+    IngestionStatusResult,
+    IngestionStatusSpec,
     ListMemoriesSpec,
     ListResult,
     ListSemanticCategoryTemplatesResponse,
@@ -82,6 +84,7 @@ from memmachine_server.server.api_v2.config_router import config_router
 from memmachine_server.server.api_v2.exceptions import RestError
 from memmachine_server.server.api_v2.service import (
     _add_messages_to,
+    _get_ingestion_status,
     _list_target_memories,
     _search_target_memories,
     _SessionData,
@@ -264,6 +267,27 @@ async def search_memories(
         return await _search_target_memories(
             target_memories=target_memories, spec=spec, memmachine=memmachine
         )
+    except ValueError as e:
+        raise RestError(code=422, message="invalid argument", ex=e) from e
+    except RuntimeError as e:
+        if "No session info found for session" in str(e):
+            raise RestError(code=404, message="Project does not exist", ex=e) from e
+        raise
+
+
+@router.post(
+    "/memories/ingestion/status",
+    description=RouterDoc.INGESTION_STATUS,
+    response_model_exclude_none=True,
+    tags=["Memories"],
+)
+async def get_ingestion_status(
+    spec: IngestionStatusSpec,
+    memmachine: Annotated[MemMachine, Depends(get_memmachine)],
+) -> IngestionStatusResult:
+    """Inspect the semantic-memory ingestion pipeline."""
+    try:
+        return await _get_ingestion_status(spec=spec, memmachine=memmachine)
     except ValueError as e:
         raise RestError(code=422, message="invalid argument", ex=e) from e
     except RuntimeError as e:

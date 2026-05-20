@@ -196,6 +196,43 @@ class SemanticSessionManager:
             set_ids=list(set_ids),
         )
 
+    def get_ingestion_thresholds(self) -> SemanticService.IngestionThresholds:
+        """Return the ingestion thresholds in effect on the semantic service."""
+        return self._semantic_service.get_ingestion_thresholds()
+
+    async def list_ingestion_statuses(
+        self,
+        *,
+        session_data: SessionData,
+        set_metadata: Mapping[str, JsonValue] | None = None,
+    ) -> AsyncIterator[SemanticService.SetIngestionStatus]:
+        """Yield ingestion status for sets matching the request.
+
+        When ``set_metadata`` is provided the request is scoped to the set_ids
+        resolved by the normal session-manager rules. When omitted, every set
+        under the caller's org/project that has at least one pending message
+        is yielded.
+        """
+        self._assert_session_data_implements_protocol(session_data=session_data)
+
+        if set_metadata is None:
+            prefix = self._org_set_id(
+                org_id=session_data.org_id,
+                project_id=session_data.project_id,
+            )
+            async for set_id in self._semantic_service.list_pending_set_ids_starts_with(
+                prefix
+            ):
+                yield await self._semantic_service.get_set_ingestion_status(set_id)
+            return
+
+        set_ids = await self._get_set_ids_str_from_metadata(
+            session_data=session_data,
+            metadata=set_metadata,
+        )
+        for set_id in set_ids:
+            yield await self._semantic_service.get_set_ingestion_status(set_id)
+
     async def add_feature(
         self,
         *,
