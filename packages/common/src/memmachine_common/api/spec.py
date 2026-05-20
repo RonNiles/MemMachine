@@ -620,6 +620,128 @@ class SearchMemoriesSpec(_WithOrgAndProj):
             examples=Examples.AGENT_MODE,
         ),
     ]
+    load_citations: Annotated[
+        bool,
+        Field(
+            default=False,
+            description=SpecDoc.FEATURE_LOAD_CITATIONS,
+        ),
+    ]
+
+
+class IngestionStatusSpec(_WithOrgAndProj):
+    """Specification model for querying ingestion pipeline status."""
+
+    set_metadata: Annotated[
+        dict[str, JsonValue] | None,
+        Field(
+            default=None,
+            description=SpecDoc.SET_METADATA,
+        ),
+    ]
+
+
+class IngestionThresholds(BaseModel):
+    """Configuration thresholds governing semantic ingestion timing."""
+
+    min_messages_to_process: Annotated[
+        int,
+        Field(..., description=SpecDoc.INGESTION_MIN_MESSAGES),
+    ]
+    max_pending_age_seconds: Annotated[
+        float,
+        Field(..., description=SpecDoc.INGESTION_MAX_PENDING_AGE_SECONDS),
+    ]
+    consolidation_threshold: Annotated[
+        int,
+        Field(..., description=SpecDoc.INGESTION_CONSOLIDATION_THRESHOLD),
+    ]
+    poll_interval_seconds: Annotated[
+        float,
+        Field(..., description=SpecDoc.INGESTION_POLL_INTERVAL_SECONDS),
+    ]
+    max_features_per_update: Annotated[
+        int,
+        Field(..., description=SpecDoc.INGESTION_MAX_FEATURES_PER_UPDATE),
+    ]
+
+
+class CategoryConsolidationStatus(BaseModel):
+    """Consolidation progress for a single category within a semantic set."""
+
+    category: Annotated[
+        str,
+        Field(..., description=SpecDoc.INGESTION_CATEGORY),
+    ]
+    feature_count: Annotated[
+        int,
+        Field(..., description=SpecDoc.INGESTION_FEATURE_COUNT),
+    ]
+    consolidation_threshold: Annotated[
+        int,
+        Field(..., description=SpecDoc.INGESTION_CONSOLIDATION_THRESHOLD),
+    ]
+    features_until_consolidation: Annotated[
+        int,
+        Field(..., description=SpecDoc.INGESTION_FEATURES_UNTIL_CONSOLIDATION),
+    ]
+
+
+class SessionIngestionStatus(BaseModel):
+    """Per-set ingestion state."""
+
+    set_id: Annotated[
+        str,
+        Field(..., description=SpecDoc.INGESTION_SET_ID),
+    ]
+    pending_message_count: Annotated[
+        int,
+        Field(..., description=SpecDoc.INGESTION_PENDING_MESSAGE_COUNT),
+    ]
+    oldest_pending_at: Annotated[
+        datetime | None,
+        Field(default=None, description=SpecDoc.INGESTION_OLDEST_PENDING_AT),
+    ]
+    oldest_pending_age_seconds: Annotated[
+        float | None,
+        Field(default=None, description=SpecDoc.INGESTION_OLDEST_PENDING_AGE_SECONDS),
+    ]
+    ready_to_process: Annotated[
+        bool,
+        Field(..., description=SpecDoc.INGESTION_READY_TO_PROCESS),
+    ]
+    messages_until_count_threshold: Annotated[
+        int,
+        Field(..., description=SpecDoc.INGESTION_MESSAGES_UNTIL_COUNT_THRESHOLD),
+    ]
+    seconds_until_age_threshold: Annotated[
+        float | None,
+        Field(default=None, description=SpecDoc.INGESTION_SECONDS_UNTIL_AGE_THRESHOLD),
+    ]
+    categories: Annotated[
+        list[CategoryConsolidationStatus],
+        Field(default_factory=list, description=SpecDoc.INGESTION_CATEGORIES),
+    ]
+
+
+class IngestionStatusResult(BaseModel):
+    """Response model for ingestion status queries."""
+
+    status: Annotated[
+        int,
+        Field(
+            default=0,
+            description=SpecDoc.STATUS,
+        ),
+    ]
+    thresholds: Annotated[
+        IngestionThresholds,
+        Field(..., description=SpecDoc.INGESTION_THRESHOLDS),
+    ]
+    sessions: Annotated[
+        list[SessionIngestionStatus],
+        Field(default_factory=list, description=SpecDoc.INGESTION_SESSIONS),
+    ]
 
 
 class DeleteMemoriesSpec(_WithOrgAndProj):

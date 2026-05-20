@@ -13,6 +13,8 @@ from memmachine_common.api.spec import (
     DeleteMemoriesSpec,
     Episode,
     EpisodicSearchResult,
+    IngestionStatusResult,
+    IngestionStatusSpec,
     ListMemoriesSpec,
     ListResult,
     ListResultContent,
@@ -118,6 +120,7 @@ async def _search_target_memories(
         if spec.score_threshold is not None
         else -float("inf"),
         agent_mode=spec.agent_mode,
+        load_citations=spec.load_citations,
     )
     content = SearchResultContent(
         episodic_memory=None,
@@ -135,6 +138,19 @@ async def _search_target_memories(
     return SearchResult(
         status=0,
         content=content,
+    )
+
+
+async def _get_ingestion_status(
+    spec: IngestionStatusSpec,
+    memmachine: MemMachine,
+) -> IngestionStatusResult:
+    return await memmachine.ingestion_status(
+        session_data=_SessionData(
+            org_id=spec.org_id,
+            project_id=spec.project_id,
+        ),
+        set_metadata=spec.set_metadata,
     )
 
 

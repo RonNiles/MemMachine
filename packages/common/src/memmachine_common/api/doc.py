@@ -141,6 +141,77 @@ class SpecDoc:
 
     FEATURE_LOAD_CITATIONS = "Whether to load referenced episode IDs."
 
+    INGESTION_THRESHOLDS = (
+        "Configuration thresholds that gate when semantic ingestion runs."
+    )
+
+    INGESTION_MIN_MESSAGES = (
+        "Minimum pending messages before a set is eligible for processing."
+    )
+
+    INGESTION_MAX_PENDING_AGE_SECONDS = (
+        "Maximum age (in seconds) of the oldest pending message before a set is "
+        "eligible for processing."
+    )
+
+    INGESTION_CONSOLIDATION_THRESHOLD = (
+        "Number of feature instances per category that triggers LLM consolidation."
+    )
+
+    INGESTION_POLL_INTERVAL_SECONDS = (
+        "Interval (in seconds) at which the background ingestion task polls "
+        "for pending sets."
+    )
+
+    INGESTION_MAX_FEATURES_PER_UPDATE = (
+        "Maximum existing features passed to the LLM per update call."
+    )
+
+    INGESTION_CATEGORY = "Name of the semantic category."
+
+    INGESTION_FEATURE_COUNT = (
+        "Current number of features stored for this set and category."
+    )
+
+    INGESTION_FEATURES_UNTIL_CONSOLIDATION = (
+        "Features remaining before the consolidation threshold is reached. "
+        "Zero means the category is currently eligible for consolidation."
+    )
+
+    INGESTION_SET_ID = "Identifier of the semantic set."
+
+    INGESTION_PENDING_MESSAGE_COUNT = (
+        "Number of un-ingested messages currently queued for this set."
+    )
+
+    INGESTION_OLDEST_PENDING_AT = (
+        "Timestamp of the oldest pending message, or null if none are pending."
+    )
+
+    INGESTION_OLDEST_PENDING_AGE_SECONDS = (
+        "Age (in seconds) of the oldest pending message, or null if none are pending."
+    )
+
+    INGESTION_READY_TO_PROCESS = (
+        "True when the set's pending count or oldest-pending age has crossed a "
+        "threshold and the next background poll will process it."
+    )
+
+    INGESTION_MESSAGES_UNTIL_COUNT_THRESHOLD = (
+        "Pending messages remaining before the message-count threshold triggers. "
+        "Zero means the count threshold has already been met."
+    )
+
+    INGESTION_SECONDS_UNTIL_AGE_THRESHOLD = (
+        "Seconds remaining before the oldest-pending-age threshold triggers, "
+        "or null if no messages are pending. Zero means the age threshold has "
+        "already been met."
+    )
+
+    INGESTION_CATEGORIES = "Per-category consolidation progress for this set."
+
+    INGESTION_SESSIONS = "Per-set ingestion status for every set matching the request."
+
     EPISODIC_SHORT_EPISODES = "Matched short-term episodic entries."
 
     EPISODIC_SHORT_SUMMARY = "Summaries of matched short-term episodes."
@@ -751,6 +822,24 @@ class RouterDoc:
     instead of being ignored.
     The set_metadata field scopes semantic memories to matching semantic sets.
     The types field allows specifying which memory types to include in the search.
+    """
+
+    INGESTION_STATUS = """
+    Inspect the semantic-memory ingestion pipeline.
+
+    Returns per-set state for the asynchronous ingestion background task:
+    how many messages are pending, how long the oldest has been queued,
+    whether the set has crossed a threshold and is about to be processed,
+    and per-category progress toward the consolidation threshold.
+
+    The `set_metadata` field scopes the response to a specific semantic set
+    (matching the same resolution used by `/memories` and `/memories/search`).
+    Omit `set_metadata` to enumerate every set under the project that has at
+    least one pending message — useful for debugging an ingestion backlog or
+    discovering which sessions are queued up.
+
+    The `thresholds` field reports the live ingestion configuration so callers
+    can interpret pending counts and ages without hard-coding constants.
     """
 
     LIST_MEMORIES = """

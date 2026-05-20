@@ -724,6 +724,56 @@ class Neo4jSemanticStorage(SemanticStorage):
                 continue
             yield SetIdT(str(record["set_id"]))
 
+    async def get_oldest_pending_history_at(
+        self,
+        set_id: SetIdT,
+    ) -> datetime | None:
+        records, _, _ = await self._driver.execute_query(
+            _neo4j_query(
+                """
+                MATCH (h:SetHistory)
+                WHERE h.set_id = $set_id
+                  AND coalesce(h.is_ingested, false) = false
+                RETURN min(h.created_at) AS oldest
+                """
+            ),
+            set_id=str(set_id),
+        )
+        if not records:
+            return None
+        raw = records[0].get("oldest")
+        if raw is None:
+            return None
+        # Neo4j returns DateTime; convert to stdlib datetime if needed.
+        if isinstance(raw, datetime):
+            return raw
+        to_native = getattr(raw, "to_native", None)
+        if callable(to_native):
+            return cast(datetime, to_native())
+        return None
+
+    async def get_feature_counts_by_category(
+        self,
+        set_id: SetIdT,
+    ) -> Mapping[str, int]:
+        records, _, _ = await self._driver.execute_query(
+            _neo4j_query(
+                """
+                MATCH (f:Feature)
+                WHERE f.set_id = $set_id
+                RETURN f.category_name AS category, count(*) AS cnt
+                """
+            ),
+            set_id=str(set_id),
+        )
+        counts: dict[str, int] = {}
+        for record in records:
+            category = record.get("category")
+            if category is None:
+                continue
+            counts[str(category)] = int(record.get("cnt", 0))
+        return counts
+
     async def add_history_to_set(self, set_id: SetIdT, history_id: EpisodeIdT) -> None:
         await self._driver.execute_query(
             """
