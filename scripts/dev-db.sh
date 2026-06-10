@@ -15,7 +15,7 @@ NEO_PASS="neo4j_password"
 
 usage() {
   cat <<EOF
-Usage: $0 {up|down|status|logs|psql|cypher}
+Usage: $0 {up|down|status|logs|psql|cypher|reset}
 
   up      Start Postgres (pgvector) and Neo4j containers (idempotent).
   down    Stop and remove both containers. Named volumes are preserved.
@@ -23,9 +23,8 @@ Usage: $0 {up|down|status|logs|psql|cypher}
   logs    Tail logs for both containers (Ctrl-C to exit).
   psql    Open a psql shell inside the Postgres container.
   cypher  Open a cypher-shell inside the Neo4j container.
-
-Data volumes: mm-pg-data, mm-neo4j-data. Delete them manually with
-'docker volume rm' if you want a clean slate.
+  reset   Delete the data volumes (mm-pg-data, mm-neo4j-data) for a clean
+          slate. Containers must not be running; prompts for confirmation.
 EOF
 }
 
@@ -85,6 +84,31 @@ down() {
   done
 }
 
+reset() {
+  for n in "$PG_NAME" "$NEO_NAME"; do
+    if docker ps --format '{{.Names}}' | grep -qx "$n"; then
+      echo "[!] $n is still running — run '$0 down' first" >&2
+      exit 1
+    fi
+  done
+
+  echo "This will permanently delete the data volumes mm-pg-data and mm-neo4j-data."
+  read -r -p "Continue? [y/N] " answer
+  case "$answer" in
+    [yY]|[yY][eE][sS]) ;;
+    *) echo "Aborted."; exit 1 ;;
+  esac
+
+  for v in mm-pg-data mm-neo4j-data; do
+    if docker volume inspect "$v" >/dev/null 2>&1; then
+      echo "[-] removing volume $v"
+      docker volume rm "$v" >/dev/null
+    else
+      echo "[=] volume $v does not exist"
+    fi
+  done
+}
+
 status() { docker ps -a --filter "name=$PG_NAME" --filter "name=$NEO_NAME"; }
 logs()   { docker logs -f "$PG_NAME" & docker logs -f "$NEO_NAME"; wait; }
 psql()   { docker exec -it "$PG_NAME" psql -U "$PG_USER" -d "$PG_DB"; }
@@ -97,5 +121,6 @@ case "${1:-}" in
   logs)   logs ;;
   psql)   psql ;;
   cypher) cypher ;;
+  reset)  reset ;;
   *)      usage; exit 1 ;;
 esac
