@@ -19,6 +19,7 @@ from .short_term_memory.short_term_memory import ShortTermMemory
 async def episodic_memory_params_from_config(
     config: EpisodicMemoryConf,
     resource_manager: InstanceOf[CommonResourceManager],
+    deterministic_ingestion: bool = False,
 ) -> EpisodicMemoryParams:
     """Create EpisodicMemoryParams from configuration and resource manager."""
     long_term_memory: LongTermMemory | None = None
@@ -34,6 +35,7 @@ async def episodic_memory_params_from_config(
         short_term_memory_params = await short_term_memory_params_from_config(
             config.short_term_memory,
             resource_manager,
+            deterministic_ingestion=deterministic_ingestion,
         )
         short_term_memory = await ShortTermMemory.create(short_term_memory_params)
 

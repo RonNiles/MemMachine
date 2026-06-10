@@ -6,6 +6,7 @@ import logging
 
 from pydantic import SecretStr
 
+from memmachine_server.common.cache import LLMCacheStore
 from memmachine_server.common.configuration.language_model_conf import (
     AmazonBedrockLanguageModelConf,
     LanguageModelsConf,
@@ -22,10 +23,13 @@ logger = logging.getLogger(__name__)
 class LanguageModelManager(BaseResourceManager[LanguageModel]):
     """Create and cache configured language model instances."""
 
-    def __init__(self, conf: LanguageModelsConf) -> None:
+    def __init__(
+        self, conf: LanguageModelsConf, cache_store: LLMCacheStore | None = None
+    ) -> None:
         """Store configuration and initialize caches."""
         super().__init__()
         self.conf = conf
+        self._cache_store = cache_store
         # Alias for backward compatibility
         self._language_models = self._resources
 
@@ -173,7 +177,48 @@ class LanguageModelManager(BaseResourceManager[LanguageModel]):
             )
         if validate:
             await self._validate_language_model(name, ret)
+        # Wrap after validation so the validation probe hits the real provider
+        # and is not seeded into the cache.
+        if self._cache_store is not None:
+            from memmachine_server.common.language_model.caching_language_model import (
+                CachingLanguageModel,
+            )
+
+            signature = self._language_model_signature(name)
+            ret = CachingLanguageModel(ret, signature, self._cache_store)
+            logger.info("Language model '%s' wrapped with persistent LLM cache.", name)
         return ret
+
+    def _language_model_signature(self, name: str) -> str:
+        """Build a cache model signature from the language model's config."""
+        if name in self.conf.openai_responses_language_model_confs:
+            conf = self.conf.openai_responses_language_model_confs[name]
+            return LLMCacheStore.model_signature(
+                provider="openai-responses",
+                model=conf.model,
+                base_url=conf.base_url,
+                temperature=conf.temperature,
+            )
+        if name in self.conf.openai_chat_completions_language_model_confs:
+            conf = self.conf.openai_chat_completions_language_model_confs[name]
+            return LLMCacheStore.model_signature(
+                provider="openai-chat-completions",
+                model=conf.model,
+                base_url=conf.base_url,
+                temperature=conf.temperature,
+            )
+        bedrock_conf = self.conf.amazon_bedrock_language_model_confs[name]
+        return LLMCacheStore.model_signature(
+            provider="amazon-bedrock",
+            model_id=bedrock_conf.model_id,
+            region=bedrock_conf.region,
+            inference_config=(
+                bedrock_conf.inference_config.model_dump()
+                if bedrock_conf.inference_config is not None
+                else None
+            ),
+            additional_model_request_fields=bedrock_conf.additional_model_request_fields,
+        )
 
     def _build_openai_responses_language_model(self, name: str) -> LanguageModel:
         import openai
@@ -199,6 +244,7 @@ class LanguageModelManager(BaseResourceManager[LanguageModel]):
                 model=conf.model,
                 max_retry_interval_seconds=conf.max_retry_interval_seconds,
                 metrics_factory=conf.get_metrics_factory(),
+                temperature=conf.temperature,
             ),
         )
 
@@ -226,6 +272,7 @@ class LanguageModelManager(BaseResourceManager[LanguageModel]):
                 model=conf.model,
                 max_retry_interval_seconds=conf.max_retry_interval_seconds,
                 metrics_factory=conf.get_metrics_factory(),
+                temperature=conf.temperature,
             ),
         )
 

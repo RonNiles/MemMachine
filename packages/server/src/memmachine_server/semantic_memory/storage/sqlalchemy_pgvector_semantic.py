@@ -438,7 +438,11 @@ class SqlAlchemyPgVectorSemanticStorage(SemanticStorage):
         limit: int | None = None,
         is_ingested: bool | None = None,
     ) -> AsyncIterator[EpisodeIdT]:
+        # history_id holds stringified integer episode ids; ordering by
+        # (length, value) yields numeric insertion order, whereas plain string
+        # ordering would process "10" before "2".
         stmt = select(SetIngestedHistory.history_id).order_by(
+            func.length(SetIngestedHistory.history_id).asc(),
             SetIngestedHistory.history_id.asc(),
         )
 

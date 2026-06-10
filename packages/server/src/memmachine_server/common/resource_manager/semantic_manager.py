@@ -50,12 +50,14 @@ class SemanticResourceManager:
         prompt_conf: PromptConf,
         resource_manager: InstanceOf[CommonResourceManager],
         episode_storage: EpisodeStorage,
+        deterministic_ingestion: bool = False,
     ) -> None:
         """Store configuration and supporting managers."""
         self._resource_manager = resource_manager
         self._conf = semantic_conf
         self._prompt_conf = prompt_conf
         self._episode_storage = episode_storage
+        self._deterministic_ingestion = deterministic_ingestion
 
         self._semantic_service: SemanticService | None = None
         self._semantic_session_manager: SemanticSessionManager | None = None
@@ -170,6 +172,7 @@ class SemanticResourceManager:
                 uningested_time_limit=self._conf.ingestion_trigger_age,
                 uningested_message_limit=self._conf.ingestion_trigger_messages,
                 max_features_per_update=self._conf.max_features_per_update,
+                deterministic_ingestion=self._deterministic_ingestion,
             ),
         )
         return self._semantic_service

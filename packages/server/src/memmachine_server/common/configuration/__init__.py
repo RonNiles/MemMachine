@@ -19,6 +19,7 @@ from memmachine_server.common.configuration.episodic_config import (
 from memmachine_server.common.configuration.language_model_conf import (
     LanguageModelsConf,
 )
+from memmachine_server.common.configuration.llm_cache_conf import LLMCacheConf
 from memmachine_server.common.configuration.log_conf import LogConf
 from memmachine_server.common.configuration.mixin_confs import (
     ApiKeyMixin,
@@ -323,6 +324,7 @@ class Configuration(BaseModel):
     session_manager: SessionManagerConf
     resources: ResourcesConf
     episode_store: EpisodeStoreConf
+    llm_cache: LLMCacheConf = LLMCacheConf()
     server: ServerConf = ServerConf()
 
     # Path to the configuration file (set when loaded from file)
@@ -483,6 +485,7 @@ class Configuration(BaseModel):
             "session_manager": self.session_manager.to_yaml_dict(),
             "resources": self.resources.to_yaml_dict(),
             "episode_store": self.episode_store.to_yaml_dict(),
+            "llm_cache": self.llm_cache.to_yaml_dict(),
             "server": self.server.to_yaml_dict(),
         }
         return yaml.safe_dump(data, sort_keys=True)

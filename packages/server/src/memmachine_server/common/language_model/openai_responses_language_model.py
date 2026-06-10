@@ -74,6 +74,13 @@ class OpenAIResponsesLanguageModelParams(BaseModel):
             "If None, API default is used."
         ),
     )
+    temperature: float | None = Field(
+        None,
+        description=(
+            "Sampling temperature. 0 gives (near-)deterministic output. "
+            "If None, the API default is used."
+        ),
+    )
 
 
 class OpenAIResponsesLanguageModel(LanguageModel):
@@ -96,6 +103,12 @@ class OpenAIResponsesLanguageModel(LanguageModel):
 
         self._max_retry_interval_seconds = params.max_retry_interval_seconds
         self._reasoning_effort = params.reasoning_effort
+
+        # Optional sampling params spread into every API call; omitted entirely
+        # when None so the provider default is used.
+        self._sampling_kwargs: dict[str, Any] = {}
+        if params.temperature is not None:
+            self._sampling_kwargs["temperature"] = params.temperature
 
         metrics_factory = params.metrics_factory
 
@@ -161,6 +174,7 @@ class OpenAIResponsesLanguageModel(LanguageModel):
                     input=input_prompts,
                     store=False,
                     text_format=output_format,
+                    **self._sampling_kwargs,
                 )
             except openai.OpenAIError as e:
                 error_message = (
@@ -250,6 +264,7 @@ class OpenAIResponsesLanguageModel(LanguageModel):
                             model=self._model,
                             input=input_prompts,
                             store=False,
+                            **self._sampling_kwargs,
                         )
                     else:
                         response = await self._client.responses.create(
@@ -261,6 +276,7 @@ class OpenAIResponsesLanguageModel(LanguageModel):
                                 Any,
                                 tool_choice if tool_choice is not None else "auto",
                             ),
+                            **self._sampling_kwargs,
                         )
                     break
                 except (
