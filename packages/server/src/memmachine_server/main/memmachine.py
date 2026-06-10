@@ -408,6 +408,9 @@ class MemMachine:
         """
         if self._started:
             return
+        # Eagerly create the LLM cache file so enablement is visible at startup.
+        if self._resources.llm_cache_store is not None:
+            await self._resources.llm_cache_store.startup()
         self._delete_worker = asyncio.create_task(self._delete_session_worker())
         if key_to_session is not None:
             session_data_manager = await self._resources.get_session_data_manager()

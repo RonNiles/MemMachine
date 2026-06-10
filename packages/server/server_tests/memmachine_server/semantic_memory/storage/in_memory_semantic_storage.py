@@ -417,7 +417,9 @@ class InMemorySemanticStorage(SemanticStorage):
                 entry = self._features_by_id.get(feature_id)
                 if entry is None:
                     continue
-                counts[entry.semantic_type_id] = counts.get(entry.semantic_type_id, 0) + 1
+                counts[entry.semantic_type_id] = (
+                    counts.get(entry.semantic_type_id, 0) + 1
+                )
             return counts
 
     def _handle_set_change(

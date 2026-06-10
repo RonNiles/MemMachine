@@ -575,7 +575,13 @@ class Neo4jSemanticStorage(SemanticStorage):
             params["is_ingested"] = is_ingested
         if conditions:
             query.append("WHERE " + " AND ".join(conditions))
-        query.append("RETURN h.history_id AS history_id ORDER BY h.history_id")
+        # history_id holds stringified integer episode ids; ordering by
+        # (length, value) yields numeric insertion order, whereas plain string
+        # ordering would process "10" before "2".
+        query.append(
+            "RETURN h.history_id AS history_id "
+            "ORDER BY size(h.history_id), h.history_id"
+        )
         if limit is not None:
             query.append("LIMIT $limit")
             params["limit"] = limit

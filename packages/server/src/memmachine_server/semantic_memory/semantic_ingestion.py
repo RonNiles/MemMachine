@@ -90,6 +90,15 @@ class IngestionService:
             ),
             gt=0,
         )
+        deterministic_ingestion: bool = Field(
+            default=False,
+            description=(
+                "Check consolidation after each message instead of once per "
+                "polling cycle, so consolidation LLM calls trigger at points "
+                "determined only by the message sequence (required for LLM "
+                "cache hits on reruns)."
+            ),
+        )
 
     def __init__(self, params: Params) -> None:
         """Initialize the ingestion service with storage backends and helpers."""
@@ -99,6 +108,7 @@ class IngestionService:
         self._consolidation_threshold = params.consolidated_threshold
         self._debug_fail_loudly = params.debug_fail_loudly
         self._max_features_per_update = params.max_features_per_update
+        self._deterministic_ingestion = params.deterministic_ingestion
 
     async def process_set_ids(self, set_ids: list[SetIdT]) -> None:
         async def _run(set_id: SetIdT) -> None:
@@ -217,6 +227,7 @@ class IngestionService:
                         message_content=message.content,
                         model=resources.language_model,
                         update_prompt=semantic_category.prompt.update_prompt,
+                        deterministic=self._deterministic_ingestion,
                     )
                 except Exception as err:
                     if _is_context_length_exceeded_error(err):
@@ -249,6 +260,16 @@ class IngestionService:
 
                 mark_messages.append(message.uid)
 
+                if self._deterministic_ingestion:
+                    # Consolidate after every message so consolidation LLM
+                    # calls trigger at points determined only by the message
+                    # sequence, not by where polling-cycle windows land.
+                    await self._consolidate_category(
+                        set_id=set_id,
+                        semantic_category=semantic_category,
+                        resources=resources,
+                    )
+
         mark_messages: list[EpisodeIdT] = []
         semantic_category_runners = []
         for t in resources.semantic_categories:
@@ -272,10 +293,12 @@ class IngestionService:
             history_ids=mark_messages,
         )
 
-        await self._consolidate_set_memories_if_applicable(
-            set_id=set_id,
-            resources=resources,
-        )
+        # In deterministic mode consolidation already ran per message.
+        if not self._deterministic_ingestion:
+            await self._consolidate_set_memories_if_applicable(
+                set_id=set_id,
+                resources=resources,
+            )
 
     async def _apply_commands(
         self,
@@ -289,42 +312,123 @@ class IngestionService:
         for command in commands:
             match command.command:
                 case SemanticCommandType.ADD:
-                    value_embedding = (await embedder.ingest_embed([command.value]))[0]
-
-                    f_id = await self._semantic_storage.add_feature(
+                    await self._apply_add_command(
+                        command=command,
                         set_id=set_id,
                         category_name=category_name,
-                        feature=command.feature,
-                        value=command.value,
-                        tag=command.tag,
-                        embedding=np.array(value_embedding),
+                        citation_id=citation_id,
+                        embedder=embedder,
                     )
-
-                    if citation_id is not None:
-                        await self._semantic_storage.add_citations(f_id, [citation_id])
 
                 case SemanticCommandType.DELETE:
-                    filter_expr = And(
-                        left=And(
-                            left=Comparison(field="set_id", op="=", value=set_id),
-                            right=Comparison(
-                                field="category_name", op="=", value=category_name
-                            ),
-                        ),
-                        right=And(
-                            left=Comparison(
-                                field="feature", op="=", value=command.feature
-                            ),
-                            right=Comparison(field="tag", op="=", value=command.tag),
-                        ),
-                    )
-
                     await self._semantic_storage.delete_feature_set(
-                        filter_expr=filter_expr
+                        filter_expr=self._feature_identity_filter(
+                            set_id=set_id,
+                            category_name=category_name,
+                            tag=command.tag,
+                            feature=command.feature,
+                        ),
                     )
 
                 case _:
                     logger.error("Command with unknown action: %s", command.command)
+
+    @staticmethod
+    def _feature_identity_filter(
+        *,
+        set_id: SetIdT,
+        category_name: str,
+        tag: str,
+        feature: str,
+    ) -> And:
+        """Filter matching the unique identity of a feature within a set.
+
+        A feature is identified by (set_id, category, tag, feature name); the
+        profile rendering already collapses features to one value per
+        (tag, feature name), so this is the natural upsert/delete key.
+        """
+        return And(
+            left=And(
+                left=Comparison(field="set_id", op="=", value=set_id),
+                right=Comparison(field="category_name", op="=", value=category_name),
+            ),
+            right=And(
+                left=Comparison(field="feature", op="=", value=feature),
+                right=Comparison(field="tag", op="=", value=tag),
+            ),
+        )
+
+    async def _find_existing_feature(
+        self,
+        *,
+        set_id: SetIdT,
+        category_name: str,
+        tag: str,
+        feature: str,
+    ) -> SemanticFeature | None:
+        """Return an existing feature with this identity, if any."""
+        async for f in self._semantic_storage.get_feature_set(
+            filter_expr=self._feature_identity_filter(
+                set_id=set_id,
+                category_name=category_name,
+                tag=tag,
+                feature=feature,
+            ),
+            page_size=1,
+        ):
+            return f
+        return None
+
+    async def _apply_add_command(
+        self,
+        *,
+        command: SemanticCommand,
+        set_id: SetIdT,
+        category_name: str,
+        citation_id: EpisodeIdT | None,
+        embedder: InstanceOf[Embedder],
+    ) -> None:
+        """Apply an ADD command as an upsert keyed on (tag, feature name).
+
+        Extraction routinely re-emits ADD for a feature that already exists.
+        Inserting a fresh row each time lets duplicates accumulate without
+        bound (the rendering only ever shows one value per tag/feature name),
+        which bloats consolidation inputs and prompts. Update the existing row
+        in place instead, merging the new citation. Only re-embed when the
+        value actually changed, so identical re-adds cost no embedding call.
+        """
+        existing = await self._find_existing_feature(
+            set_id=set_id,
+            category_name=category_name,
+            tag=command.tag,
+            feature=command.feature,
+        )
+
+        if existing is not None and existing.metadata.id is not None:
+            if existing.value != command.value:
+                value_embedding = (await embedder.ingest_embed([command.value]))[0]
+                await self._semantic_storage.update_feature(
+                    existing.metadata.id,
+                    value=command.value,
+                    embedding=np.array(value_embedding),
+                )
+            if citation_id is not None:
+                await self._semantic_storage.add_citations(
+                    existing.metadata.id, [citation_id]
+                )
+            return
+
+        value_embedding = (await embedder.ingest_embed([command.value]))[0]
+        f_id = await self._semantic_storage.add_feature(
+            set_id=set_id,
+            category_name=category_name,
+            feature=command.feature,
+            value=command.value,
+            tag=command.tag,
+            embedding=np.array(value_embedding),
+        )
+        if citation_id is not None:
+            await self._semantic_storage.add_citations(f_id, [citation_id])
 
     async def _consolidate_set_memories_if_applicable(
         self,
@@ -332,56 +436,64 @@ class IngestionService:
         set_id: SetIdT,
         resources: InstanceOf[Resources],
     ) -> None:
-        async def _consolidate_type(
-            semantic_category: InstanceOf[SemanticCategory],
-        ) -> None:
-            from memmachine_server.common.filter.filter_parser import And, Comparison
-
-            filter_expr = And(
-                left=Comparison(field="set_id", op="=", value=set_id),
-                right=Comparison(
-                    field="category_name", op="=", value=semantic_category.name
-                ),
+        category_tasks = [
+            self._consolidate_category(
+                set_id=set_id,
+                semantic_category=t,
+                resources=resources,
             )
-
-            features = [
-                f
-                async for f in self._semantic_storage.get_feature_set(
-                    filter_expr=filter_expr,
-                    tag_threshold=self._consolidation_threshold,
-                    load_citations=True,
-                )
-            ]
-
-            consolidation_sections: list[Sequence[SemanticFeature]] = list(
-                SemanticFeature.group_features_by_tag(features).values(),
-            )
-
-            if self._consolidation_threshold > 0:
-                consolidation_sections = [
-                    section
-                    for section in consolidation_sections
-                    if len(section) >= self._consolidation_threshold
-                ]
-
-            await asyncio.gather(
-                *[
-                    self._deduplicate_features(
-                        set_id=set_id,
-                        memories=section_features,
-                        resources=resources,
-                        semantic_category=semantic_category,
-                    )
-                    for section_features in consolidation_sections
-                ],
-            )
-
-        category_tasks = []
-        for t in resources.semantic_categories:
-            task = _consolidate_type(t)
-            category_tasks.append(task)
+            for t in resources.semantic_categories
+        ]
 
         await asyncio.gather(*category_tasks)
+
+    async def _consolidate_category(
+        self,
+        *,
+        set_id: SetIdT,
+        semantic_category: InstanceOf[SemanticCategory],
+        resources: InstanceOf[Resources],
+    ) -> None:
+        from memmachine_server.common.filter.filter_parser import And, Comparison
+
+        filter_expr = And(
+            left=Comparison(field="set_id", op="=", value=set_id),
+            right=Comparison(
+                field="category_name", op="=", value=semantic_category.name
+            ),
+        )
+
+        features = [
+            f
+            async for f in self._semantic_storage.get_feature_set(
+                filter_expr=filter_expr,
+                tag_threshold=self._consolidation_threshold,
+                load_citations=True,
+            )
+        ]
+
+        consolidation_sections: list[Sequence[SemanticFeature]] = list(
+            SemanticFeature.group_features_by_tag(features).values(),
+        )
+
+        if self._consolidation_threshold > 0:
+            consolidation_sections = [
+                section
+                for section in consolidation_sections
+                if len(section) >= self._consolidation_threshold
+            ]
+
+        await asyncio.gather(
+            *[
+                self._deduplicate_features(
+                    set_id=set_id,
+                    memories=section_features,
+                    resources=resources,
+                    semantic_category=semantic_category,
+                )
+                for section_features in consolidation_sections
+            ],
+        )
 
     async def _try_consolidate(
         self,
@@ -407,6 +519,7 @@ class IngestionService:
                     features=features,
                     model=model,
                     consolidate_prompt=consolidation_prompt,
+                    deterministic=self._deterministic_ingestion,
                 )
             except Exception as err:
                 if _is_context_length_exceeded_error(err):

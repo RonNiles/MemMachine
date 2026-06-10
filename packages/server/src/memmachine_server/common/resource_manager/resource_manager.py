@@ -7,6 +7,7 @@ from asyncio import Lock
 from neo4j import AsyncDriver
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from memmachine_server.common.cache import LLMCacheStore
 from memmachine_server.common.configuration import Configuration
 from memmachine_server.common.configuration.mixin_confs import MetricsFactoryIdMixin
 from memmachine_server.common.embedder import Embedder
@@ -63,14 +64,37 @@ class ResourceManagerImpl:
         """Initialize managers from configuration."""
         self._conf = conf
         self._conf.logging.apply()
+
+        # Optional persistent cache for LLM responses and embeddings.
+        self._llm_cache_store: LLMCacheStore | None = None
+        if self._conf.llm_cache.enabled:
+            self._llm_cache_store = LLMCacheStore(
+                self._conf.llm_cache.path,
+                emulate_latency=self._conf.llm_cache.emulate_latency,
+            )
+            logger.info(
+                "LLM cache enabled: path='%s' cache_llm=%s cache_embeddings=%s "
+                "emulate_latency=%s",
+                self._conf.llm_cache.path,
+                self._conf.llm_cache.cache_llm,
+                self._conf.llm_cache.cache_embeddings,
+                self._conf.llm_cache.emulate_latency,
+            )
+        embedder_cache = (
+            self._llm_cache_store if self._conf.llm_cache.cache_embeddings else None
+        )
+        llm_cache = self._llm_cache_store if self._conf.llm_cache.cache_llm else None
+
         self._database_manager: DatabaseManager = DatabaseManager(
             self._conf.resources.databases
         )
         self._embedder_manager: EmbedderManager = EmbedderManager(
-            self._conf.resources.embedders
+            self._conf.resources.embedders,
+            cache_store=embedder_cache,
         )
         self._model_manager: LanguageModelManager = LanguageModelManager(
             self._conf.resources.language_models,
+            cache_store=llm_cache,
         )
         self._reranker_manager: RerankerManager = RerankerManager(
             self._conf.resources.rerankers,
@@ -92,6 +116,9 @@ class ResourceManagerImpl:
 
     async def build(self) -> None:
         """Build all configured resources in parallel."""
+        if self._llm_cache_store is not None:
+            await self._llm_cache_store.startup()
+
         tasks = [
             self._database_manager.build_all(validate=True),
             self._embedder_manager.build_all(),
@@ -114,6 +141,9 @@ class ResourceManagerImpl:
         )
 
         tasks.append(self._database_manager.close())
+
+        if self._llm_cache_store is not None:
+            tasks.append(self._llm_cache_store.close())
 
         await asyncio.gather(*tasks)
 
@@ -191,6 +221,9 @@ class ResourceManagerImpl:
                     params = EpisodicMemoryManagerParams(
                         resource_manager=self,
                         session_data_manager=session_data_manager,
+                        deterministic_ingestion=(
+                            self._conf.llm_cache.deterministic_ingestion
+                        ),
                     )
                     self._episodic_memory_manager = EpisodicMemoryManager(params)
         assert self._episodic_memory_manager is not None
@@ -234,6 +267,9 @@ class ResourceManagerImpl:
                         prompt_conf=self._conf.prompt,
                         resource_manager=self,
                         episode_storage=episode_storage,
+                        deterministic_ingestion=(
+                            self._conf.llm_cache.deterministic_ingestion
+                        ),
                     )
         assert self._semantic_manager is not None
         return self._semantic_manager
@@ -251,6 +287,11 @@ class ResourceManagerImpl:
         if ret is None:
             raise ValueError(f"MetricsFactory '{name}' could not be created.")
         return ret
+
+    @property
+    def llm_cache_store(self) -> LLMCacheStore | None:
+        """Return the LLM cache store, or None when caching is disabled."""
+        return self._llm_cache_store
 
     @property
     def embedder_manager(self) -> EmbedderManager:
