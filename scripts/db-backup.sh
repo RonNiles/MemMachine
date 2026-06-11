@@ -6,9 +6,10 @@
 # detects a running server (override with FORCE=1 / --force).
 #
 # Postgres : pg_dump custom-format archive (postgres.dump).
-# Neo4j    : STOP DATABASE -> neo4j-admin database dump -> START DATABASE
-#            (offline dump of just the `neo4j` database; the container/DBMS
-#            stays up, only the one database is briefly stopped).
+# Neo4j    : stop the container -> offline `neo4j-admin database dump` in a
+#            throwaway container sharing the data volume -> start the container.
+#            STOP/START DATABASE is Enterprise-only, so Community Edition must
+#            take the whole DBMS offline for a consistent dump.
 # Config   : copies configuration.yml / .env (whichever exist) for reference.
 #
 # Container names and credentials match scripts/dev-db.sh; override via env.
@@ -18,12 +19,17 @@ PG_CONTAINER="${PG_CONTAINER:-memmachine-postgres-dev}"
 NEO_CONTAINER="${NEO_CONTAINER:-memmachine-neo4j-dev}"
 PG_USER="${PG_USER:-memmachine}"
 PG_DB="${PG_DB:-memmachine}"
-NEO_USER="${NEO_USER:-neo4j}"
-NEO_PASS="${NEO_PASS:-neo4j_password}"
 NEO_DB="${NEO_DB:-neo4j}"
+# uid:gid the Neo4j data files are owned by inside the container (official
+# image uses 7474:7474). Used to chown /data back after an offline restore.
+NEO_UID="${NEO_UID:-7474}"
+NEO_GID="${NEO_GID:-7474}"
 # Space-separated, resolved relative to the repo root.
 CONFIG_FILES="${CONFIG_FILES:-configuration.yml .env}"
 FORCE="${FORCE:-0}"
+
+HOST_UID="$(id -u)"
+HOST_GID="$(id -g)"
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
@@ -36,8 +42,8 @@ Usage: $0 backup  <target-dir> [--force]
   restore  OVERWRITE the live Postgres + Neo4j data from <source-dir>.
 
 Both require the two DB containers running and memmachine-server stopped.
-Env overrides: PG_CONTAINER NEO_CONTAINER PG_USER PG_DB NEO_USER NEO_PASS
-               NEO_DB CONFIG_FILES FORCE
+Env overrides: PG_CONTAINER NEO_CONTAINER PG_USER PG_DB
+               NEO_DB NEO_UID NEO_GID CONFIG_FILES FORCE
 EOF
 }
 
@@ -59,8 +65,8 @@ ensure_server_down() {
   [ -z "$others" ] || die "other memmachine container(s) running: ${others//$'\n'/ } (stop them, or FORCE=1)."
 }
 
-neo4j_sys() { docker exec "$NEO_CONTAINER" cypher-shell -u "$NEO_USER" -p "$NEO_PASS" -d system "$1" >/dev/null; }
-neo4j_start_safety() { neo4j_sys "START DATABASE $NEO_DB WAIT" 2>/dev/null || true; }
+neo_image()         { docker inspect -f '{{.Config.Image}}' "$NEO_CONTAINER"; }
+neo_start_safety()  { docker start "$NEO_CONTAINER" >/dev/null 2>&1 || true; }
 
 backup() {
   local target="${1:-}"
@@ -75,15 +81,26 @@ backup() {
   echo "[*] Postgres: pg_dump $PG_DB -> $target/postgres.dump"
   docker exec "$PG_CONTAINER" pg_dump -U "$PG_USER" -d "$PG_DB" -Fc > "$target/postgres.dump"
 
-  echo "[*] Neo4j: stop '$NEO_DB', dump, start"
-  docker exec "$NEO_CONTAINER" sh -c 'rm -rf /tmp/mm-backup && mkdir -p /tmp/mm-backup'
-  neo4j_sys "STOP DATABASE $NEO_DB WAIT"
-  trap neo4j_start_safety EXIT
-  docker exec "$NEO_CONTAINER" neo4j-admin database dump "$NEO_DB" \
-    --to-path=/tmp/mm-backup --overwrite-destination=true
-  neo4j_sys "START DATABASE $NEO_DB WAIT"
+  echo "[*] Neo4j (community): stop container, offline dump, start"
+  local img abs_target
+  img="$(neo_image)"
+  abs_target="$(cd "$target" && pwd)"
+  docker stop "$NEO_CONTAINER" >/dev/null
+  trap neo_start_safety EXIT
+  # Throwaway container shares the stopped container's /data volume; run as
+  # root so it can read the 7474-owned store and write the host bind mount,
+  # then chown the resulting dump back to the invoking user. --entrypoint sh
+  # bypasses the image entrypoint, which would otherwise drop back to the
+  # neo4j user and lose write access to the host-owned bind mount.
+  docker run --rm --user root --entrypoint sh \
+    --volumes-from "$NEO_CONTAINER" \
+    -v "$abs_target:/mm-backup" \
+    "$img" \
+    -c "neo4j-admin database dump '$NEO_DB' --to-path=/mm-backup --overwrite-destination=true \
+        && chown ${HOST_UID}:${HOST_GID} '/mm-backup/$NEO_DB.dump'"
+  docker start "$NEO_CONTAINER" >/dev/null
   trap - EXIT
-  docker cp "$NEO_CONTAINER:/tmp/mm-backup/$NEO_DB.dump" "$target/neo4j.dump"
+  [ "$NEO_DB" = "neo4j" ] || mv "$target/$NEO_DB.dump" "$target/neo4j.dump"
 
   for f in $CONFIG_FILES; do
     if [ -f "$REPO_ROOT/$f" ]; then
@@ -125,14 +142,23 @@ restore() {
   docker exec "$PG_CONTAINER" pg_restore --no-owner -U "$PG_USER" -d "$PG_DB" /tmp/postgres.dump
   docker exec "$PG_CONTAINER" rm -f /tmp/postgres.dump
 
-  echo "[*] Neo4j: stop '$NEO_DB', load, start"
-  docker exec "$NEO_CONTAINER" sh -c 'rm -rf /tmp/mm-backup && mkdir -p /tmp/mm-backup'
-  docker cp "$src/neo4j.dump" "$NEO_CONTAINER:/tmp/mm-backup/$NEO_DB.dump"
-  neo4j_sys "STOP DATABASE $NEO_DB WAIT"
-  trap neo4j_start_safety EXIT
-  docker exec "$NEO_CONTAINER" neo4j-admin database load "$NEO_DB" \
-    --from-path=/tmp/mm-backup --overwrite-destination=true
-  neo4j_sys "START DATABASE $NEO_DB WAIT"
+  echo "[*] Neo4j (community): stop container, offline load, start"
+  local img abs_src
+  img="$(neo_image)"
+  abs_src="$(cd "$src" && pwd)"
+  docker stop "$NEO_CONTAINER" >/dev/null
+  trap neo_start_safety EXIT
+  # Copy the dump to a writable path under the expected '<db>.dump' name, load
+  # it into the shared /data volume, then chown /data back to the Neo4j uid so
+  # the DBMS can start (the load ran as root).
+  docker run --rm --user root --entrypoint sh \
+    --volumes-from "$NEO_CONTAINER" \
+    -v "$abs_src:/mm-backup:ro" \
+    "$img" \
+    -c "cp '/mm-backup/neo4j.dump' '/tmp/$NEO_DB.dump' \
+        && neo4j-admin database load '$NEO_DB' --from-path=/tmp --overwrite-destination=true \
+        && chown -R ${NEO_UID}:${NEO_GID} /data"
+  docker start "$NEO_CONTAINER" >/dev/null
   trap - EXIT
 
   echo "[✓] restore complete."
