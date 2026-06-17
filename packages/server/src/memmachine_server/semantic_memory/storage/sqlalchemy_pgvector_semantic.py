@@ -29,6 +29,7 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import Connection, CursorResult
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import (
@@ -425,7 +426,14 @@ class SqlAlchemyPgVectorSemanticStorage(SemanticStorage):
             for hid in history_ids
         ]
 
-        stmt = insert(citation_association_table).values(rows)
+        # Extraction routinely re-emits ADD for an existing feature, so the
+        # same (feature_id, history_id) citation can be merged more than once.
+        # Ignore duplicates instead of letting the PK violation abort the whole
+        # ingestion set.
+        stmt = pg_insert(citation_association_table).values(rows)
+        stmt = stmt.on_conflict_do_nothing(
+            index_elements=["feature_id", "history_id"]
+        )
 
         async with self._create_session() as session:
             await session.execute(stmt)
