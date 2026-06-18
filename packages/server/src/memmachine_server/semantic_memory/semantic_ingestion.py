@@ -65,6 +65,31 @@ def _is_context_length_exceeded_error(error: Exception) -> bool:
     return False
 
 
+def _resolved_consolidated_tag(original_tag: str | None, f: LLMReducedFeature) -> str:
+    """Resolve the tag for a re-added consolidated feature and warn on anomalies.
+
+    Keeps the section's original tag (the consolidation LLM occasionally changes
+    it) and surfaces a malformed multi-name ``feature`` — feature names are
+    single snake_case identifiers, so a comma means several names were
+    concatenated into one (a consolidation-prompt quality issue). The value is
+    still stored as-is in either case.
+    """
+    tag = original_tag if original_tag is not None else f.tag
+    if tag != f.tag:
+        logger.warning(
+            "Consolidation LLM changed tag from %r to %r; reverting to original",
+            tag,
+            f.tag,
+        )
+    if "," in f.feature:
+        logger.warning(
+            "Consolidation produced a multi-name feature %r "
+            "(several feature names merged into one); storing as-is.",
+            f.feature,
+        )
+    return tag
+
+
 class IngestionService:
     """
     Processes un-ingested history for each set_id and updates semantic features.
@@ -213,13 +238,7 @@ class IngestionService:
                     ),
                 )
 
-                features = [
-                    f
-                    async for f in self._semantic_storage.get_feature_set(
-                        filter_expr=filter_expr,
-                        page_size=self._max_features_per_update,
-                    )
-                ]
+                features = await self._fetch_old_profile_features(filter_expr)
 
                 try:
                     commands = await llm_feature_update(
@@ -299,6 +318,38 @@ class IngestionService:
                 set_id=set_id,
                 resources=resources,
             )
+
+    async def _fetch_old_profile_features(
+        self, filter_expr: And
+    ) -> list[SemanticFeature]:
+        """Return the features that form a message's <OLD_PROFILE>.
+
+        In deterministic mode, fetch the full category set and select the first
+        ``max_features_per_update`` by content key ``(tag, feature, value)``, so
+        the truncated subset is a pure function of the feature *set* — not of
+        the storage's ``(created_at, id)`` order, which is not reproducible
+        across runs (consolidation re-adds merged features concurrently). When
+        the profile is at or below the cap this is identical to fetching all;
+        the divergence only appeared once a category crossed the cap.
+
+        In non-deterministic mode the original ``page_size`` LIMIT is kept.
+        """
+        if self._deterministic_ingestion:
+            features = [
+                f
+                async for f in self._semantic_storage.get_feature_set(
+                    filter_expr=filter_expr,
+                )
+            ]
+            features.sort(key=lambda f: (f.tag, f.feature_name, f.value))
+            return features[: self._max_features_per_update]
+        return [
+            f
+            async for f in self._semantic_storage.get_feature_set(
+                filter_expr=filter_expr,
+                page_size=self._max_features_per_update,
+            )
+        ]
 
     async def _apply_commands(
         self,
@@ -608,15 +659,7 @@ class IngestionService:
         original_tag = memories[0].tag if memories else None
 
         async def _add_feature(f: LLMReducedFeature) -> None:
-            tag = original_tag if original_tag is not None else f.tag
-            if tag != f.tag:
-                logger.warning(
-                    "Consolidation LLM changed tag from %r to %r; "
-                    "reverting to original tag",
-                    tag,
-                    f.tag,
-                )
-
+            tag = _resolved_consolidated_tag(original_tag, f)
             value_embedding = (await resources.embedder.ingest_embed([f.value]))[0]
 
             f_id = await self._semantic_storage.add_feature(

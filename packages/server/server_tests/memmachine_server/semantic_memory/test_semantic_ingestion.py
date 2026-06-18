@@ -13,7 +13,7 @@ from memmachine_server.common.episode_store import (
     EpisodeIdT,
     EpisodeStorage,
 )
-from memmachine_server.common.filter.filter_parser import parse_filter
+from memmachine_server.common.filter.filter_parser import And, Comparison, parse_filter
 from memmachine_server.semantic_memory.semantic_ingestion import IngestionService
 from memmachine_server.semantic_memory.semantic_llm import (
     LLMReducedFeature,
@@ -1584,3 +1584,64 @@ async def test_repeated_add_does_not_accumulate_duplicates(
         )
     )
     assert len(features) == 1
+
+
+@pytest.mark.asyncio
+async def test_deterministic_old_profile_selection_independent_of_insert_order(
+    semantic_storage: SemanticStorage,
+    episode_storage: EpisodeStorage,
+    resource_retriever: MockResourceRetriever,
+):
+    """OLD_PROFILE truncation is content-deterministic past the page_size cap.
+
+    When a category exceeds ``max_features_per_update``, the selected subset is
+    chosen by content key ``(tag, feature, value)`` — independent of the
+    storage's ``(created_at, id)`` insertion order. This is the fix for the
+    clean-batch cache-miss divergence that appeared once a category crossed the
+    cap (the cap was previously selected by non-reproducible DB order).
+    """
+    svc = IngestionService(
+        IngestionService.Params(
+            semantic_storage=semantic_storage,
+            history_store=episode_storage,
+            resource_retriever=resource_retriever.get_resources,
+            deterministic_ingestion=True,
+            max_features_per_update=10,
+        )
+    )
+    defs = [
+        ("Profile", f"tag{i % 3}", f"feat_{i:02d}", f"value {i}") for i in range(15)
+    ]
+
+    async def seed(set_id: str, ordered: list[tuple[str, str, str, str]]) -> None:
+        for cat, tag, feat, val in ordered:
+            await semantic_storage.add_feature(
+                set_id=set_id,
+                category_name=cat,
+                feature=feat,
+                value=val,
+                tag=tag,
+                embedding=np.array([1.0, 1.0]),
+            )
+
+    await seed("setA", defs)
+    await seed("setB", list(reversed(defs)))  # different (created_at, id) order
+
+    def filt(set_id: str) -> And:
+        return And(
+            left=Comparison(field="set_id", op="=", value=set_id),
+            right=Comparison(field="category", op="=", value="Profile"),
+        )
+
+    fa = await svc._fetch_old_profile_features(filt("setA"))
+    fb = await svc._fetch_old_profile_features(filt("setB"))
+
+    def keyf(fs: list) -> list[tuple[str, str, str]]:
+        return [(f.tag, f.feature_name, f.value) for f in fs]
+
+    # Truncated to the cap, identical selection regardless of insert order,
+    # and equal to the content-sorted first N.
+    assert len(fa) == 10
+    assert keyf(fa) == keyf(fb)
+    expected = sorted((t, fe, v) for _, t, fe, v in defs)[:10]
+    assert keyf(fa) == expected
