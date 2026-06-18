@@ -11,6 +11,8 @@
 #            STOP/START DATABASE is Enterprise-only, so Community Edition must
 #            take the whole DBMS offline for a consistent dump.
 # Config   : copies configuration.yml / .env (whichever exist) for reference.
+# Cache    : copies llm_cache.db (+ -wal/-shm sidecars) from the repo root if
+#            present — the persistent LLM/embedding cache. Restored in place.
 #
 # Container names and credentials match scripts/dev-db.sh; override via env.
 set -euo pipefail
@@ -26,6 +28,8 @@ NEO_UID="${NEO_UID:-7474}"
 NEO_GID="${NEO_GID:-7474}"
 # Space-separated, resolved relative to the repo root.
 CONFIG_FILES="${CONFIG_FILES:-configuration.yml .env}"
+# SQLite LLM/embedding cache at the repo root; backed up if present.
+LLM_CACHE="${LLM_CACHE:-llm_cache.db}"
 FORCE="${FORCE:-0}"
 # Verify each fresh Neo4j dump by test-loading it in a throwaway container
 # (catches a corrupt/truncated archive at backup time). Set VERIFY=0 to skip.
@@ -135,11 +139,22 @@ backup() {
     fi
   done
 
+  local files="postgres.dump neo4j.dump config/"
+  if [ -f "$REPO_ROOT/$LLM_CACHE" ]; then
+    # Server is down, so a cold copy of the db plus its WAL/SHM sidecars is
+    # consistent (SQLite recovers the WAL on next open).
+    for ext in "" "-wal" "-shm"; do
+      [ -f "$REPO_ROOT/$LLM_CACHE$ext" ] && cp "$REPO_ROOT/$LLM_CACHE$ext" "$target/"
+    done
+    files="$files $LLM_CACHE"
+    echo "[*] llm cache: $LLM_CACHE"
+  fi
+
   {
     echo "created: $ts"
     echo "pg_container: $PG_CONTAINER  pg_db: $PG_DB"
     echo "neo_container: $NEO_CONTAINER  neo_db: $NEO_DB"
-    echo "files: postgres.dump neo4j.dump config/"
+    echo "files: $files"
   } > "$target/MANIFEST.txt"
 
   echo "[✓] backup complete -> $target"
@@ -186,6 +201,13 @@ restore() {
         && chown -R ${NEO_UID}:${NEO_GID} /data"
   docker start "$NEO_CONTAINER" >/dev/null
   trap - EXIT
+
+  if [ -f "$src/$LLM_CACHE" ]; then
+    for ext in "" "-wal" "-shm"; do
+      [ -f "$src/$LLM_CACHE$ext" ] && cp "$src/$LLM_CACHE$ext" "$REPO_ROOT/"
+    done
+    echo "[*] llm cache: restored $LLM_CACHE -> repo root"
+  fi
 
   echo "[✓] restore complete."
   echo "    Note: config files in $src/config are NOT auto-applied — copy them"
