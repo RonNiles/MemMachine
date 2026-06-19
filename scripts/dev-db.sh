@@ -10,6 +10,12 @@ PG_USER="memmachine"
 PG_PASS="memmachine_password"
 PG_DB="memmachine"
 
+# Host port to map Postgres to. Override if 5432 is already taken on your
+# machine, e.g. `PG_PORT=5433 ./scripts/dev-db.sh up`. The container always
+# listens on 5432 internally; only the host-side mapping changes. Make sure
+# your .env sets POSTGRES_PORT to the same value.
+PG_PORT="${PG_PORT:-5432}"
+
 NEO_USER="neo4j"
 NEO_PASS="neo4j_password"
 
@@ -47,7 +53,7 @@ up() {
     echo "[+] creating $PG_NAME (pgvector/pgvector:pg16)"
     docker run -d \
       --name "$PG_NAME" \
-      -p 5432:5432 \
+      -p "${PG_PORT}:5432" \
       -e POSTGRES_USER="$PG_USER" \
       -e POSTGRES_PASSWORD="$PG_PASS" \
       -e POSTGRES_DB="$PG_DB" \
@@ -68,7 +74,7 @@ up() {
       neo4j:5.23-community >/dev/null
   fi
 
-  echo "[*] Postgres -> localhost:5432  user=$PG_USER db=$PG_DB"
+  echo "[*] Postgres -> localhost:${PG_PORT}  user=$PG_USER db=$PG_DB"
   echo "[*] Neo4j    -> bolt://localhost:7687  http://localhost:7474  user=$NEO_USER"
   echo
   echo "Run migrations once Postgres is healthy:"
