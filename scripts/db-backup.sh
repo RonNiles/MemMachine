@@ -27,6 +27,9 @@ NEO_GID="${NEO_GID:-7474}"
 # Space-separated, resolved relative to the repo root.
 CONFIG_FILES="${CONFIG_FILES:-configuration.yml .env}"
 FORCE="${FORCE:-0}"
+# Verify each fresh Neo4j dump by test-loading it in a throwaway container
+# (catches a corrupt/truncated archive at backup time). Set VERIFY=0 to skip.
+VERIFY="${VERIFY:-1}"
 
 HOST_UID="$(id -u)"
 HOST_GID="$(id -g)"
@@ -43,7 +46,7 @@ Usage: $0 backup  <target-dir> [--force]
 
 Both require the two DB containers running and memmachine-server stopped.
 Env overrides: PG_CONTAINER NEO_CONTAINER PG_USER PG_DB
-               NEO_DB NEO_UID NEO_GID CONFIG_FILES FORCE
+               NEO_DB NEO_UID NEO_GID CONFIG_FILES FORCE VERIFY
 EOF
 }
 
@@ -67,6 +70,21 @@ ensure_server_down() {
 
 neo_image()         { docker inspect -f '{{.Config.Image}}' "$NEO_CONTAINER"; }
 neo_start_safety()  { docker start "$NEO_CONTAINER" >/dev/null 2>&1 || true; }
+
+# Test-load a just-created dump in a throwaway container with NO access to the
+# live /data volume (its own ephemeral /data), proving the archive restores
+# end-to-end. A truncated/corrupt dump makes neo4j-admin load exit non-zero.
+# $1 = image, $2 = absolute dir holding '<NEO_DB>.dump'.
+neo_verify_dump() {
+  local img="$1" dir="$2"
+  echo "[*] Neo4j: verifying dump (test-load in throwaway container)"
+  docker run --rm --user root --entrypoint sh \
+    -v "$dir:/mm-backup:ro" \
+    "$img" \
+    -c "cp '/mm-backup/$NEO_DB.dump' '/tmp/$NEO_DB.dump' \
+        && neo4j-admin database load '$NEO_DB' --from-path=/tmp --overwrite-destination=true >/dev/null 2>&1" \
+    || die "dump verification failed: '$dir/$NEO_DB.dump' is not a loadable archive (corrupt/truncated)."
+}
 
 backup() {
   local target="${1:-}"
@@ -92,14 +110,22 @@ backup() {
   # then chown the resulting dump back to the invoking user. --entrypoint sh
   # bypasses the image entrypoint, which would otherwise drop back to the
   # neo4j user and lose write access to the host-owned bind mount.
+  #
+  # rm -f the destination FIRST: neo4j-admin's --overwrite-destination writes
+  # over the existing file in place but does NOT truncate it, so dumping a
+  # smaller archive onto a larger pre-existing one (e.g. a prior backup into
+  # the same dir) leaves the old tail past the new zstd frame -> a corrupt
+  # archive that loads partway then fails with "Unknown frame descriptor".
   docker run --rm --user root --entrypoint sh \
     --volumes-from "$NEO_CONTAINER" \
     -v "$abs_target:/mm-backup" \
     "$img" \
-    -c "neo4j-admin database dump '$NEO_DB' --to-path=/mm-backup --overwrite-destination=true \
+    -c "rm -f '/mm-backup/$NEO_DB.dump' \
+        && neo4j-admin database dump '$NEO_DB' --to-path=/mm-backup --overwrite-destination=true \
         && chown ${HOST_UID}:${HOST_GID} '/mm-backup/$NEO_DB.dump'"
   docker start "$NEO_CONTAINER" >/dev/null
   trap - EXIT
+  [ "$VERIFY" = "1" ] && neo_verify_dump "$img" "$abs_target"
   [ "$NEO_DB" = "neo4j" ] || mv "$target/$NEO_DB.dump" "$target/neo4j.dump"
 
   for f in $CONFIG_FILES; do
