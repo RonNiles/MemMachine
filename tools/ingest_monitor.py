@@ -84,11 +84,21 @@ def read_cache(db_path: str):
 
 
 def pg_remaining(container: str):
-    """Return (done, pending, total, features) from Postgres, or None on failure."""
+    """Return (done, pending, total, features) from Postgres, or None on failure.
+
+    Counts are per distinct *history* (message), not per (set_id, history_id)
+    row. The same message is shared across all of a user's sets, and the ETA
+    rate is measured in distinct messages/min (the extraction prompt's
+    <HISTORY> hash is set-independent), so counting raw rows would inflate the
+    remaining work by the sets-per-history factor and overestimate the ETA. A
+    history is "done" only once all its set rows are ingested.
+    """
     sql = (
-        "SELECT (SELECT count(*) FILTER (WHERE ingested) FROM set_ingested_history), "
-        "(SELECT count(*) FILTER (WHERE NOT ingested) FROM set_ingested_history), "
-        "(SELECT count(*) FROM set_ingested_history), "
+        "WITH h AS (SELECT history_id, bool_and(ingested) AS done "
+        "FROM set_ingested_history GROUP BY history_id) "
+        "SELECT (SELECT count(*) FILTER (WHERE done) FROM h), "
+        "(SELECT count(*) FILTER (WHERE NOT done) FROM h), "
+        "(SELECT count(*) FROM h), "
         "(SELECT count(*) FROM feature);"
     )
     try:
@@ -227,12 +237,33 @@ def render(args) -> str:
         out.append(f"  last {mins:>2}m: {len(msgs):>4} msgs  = {rate:6.1f} msg/min  "
                    f"({rate * 60:6.0f}/hr)")
 
-    # recent rate for ETA: prefer last 15m, fall back to 30m
+    # recent rate for ETA: use the longest *fully populated* interval up to 15m,
+    # measured back from now. Stale rows from a prior run can sit far in the
+    # past; keying the window off the earliest row would divide a recent burst
+    # by a mostly-idle 15m and badly inflate the ETA. Instead, walk back from
+    # now and stop at the first idle gap longer than --eta-gap minutes, so only
+    # contiguous recent activity sets the window.
+    first_seen = {}
+    for r in llm:
+        if r["msg"]:
+            ts = r["ts"].timestamp()
+            first_seen[r["msg"]] = min(ts, first_seen.get(r["msg"], ts))
+
     def rate_per_min(mins):
         c = now.timestamp() - mins * 60
-        return len({r["msg"] for r in llm if r["msg"] and r["ts"].timestamp() >= c}) / mins
+        return sum(1 for ts in first_seen.values() if ts >= c) / mins
 
-    eta_rate = rate_per_min(15) or rate_per_min(30) or rate_per_min(60)
+    gap = args.eta_gap * 60
+    prev = now.timestamp()
+    window_start = prev
+    for ts in sorted(first_seen.values(), reverse=True):
+        if prev - ts > gap:
+            break
+        window_start, prev = ts, ts
+    eta_window = min((now.timestamp() - window_start) / 60, 15)
+    # within 15m: use the contiguous populated span; else fall back wider
+    eta_rate = (rate_per_min(eta_window) if eta_window > 0 else 0) \
+        or rate_per_min(30) or rate_per_min(60)
 
     # ---- latency / rate-limit summary (last window) ----
     recent_chat = [r["lat"] for r in llm if r["ts"].timestamp() >= cutoff]
@@ -258,7 +289,7 @@ def render(args) -> str:
     pg = None if args.no_pg else pg_remaining(args.pg_container)
     if pg:
         done, pg_pending, total, feats = pg
-        out.append(f"progress (postgres): {done}/{total} ingested, "
+        out.append(f"progress (postgres): {done}/{total} msgs ingested, "
                    f"{pg_pending} pending | {feats} profile features")
         if pending is None:
             pending = pg_pending
@@ -288,6 +319,8 @@ def main():
                     help="remaining messages (overrides Postgres)")
     ap.add_argument("--full-corpus", type=int, default=None,
                     help="extrapolate wall-clock for a full corpus of this many msgs")
+    ap.add_argument("--eta-gap", type=float, default=3.0,
+                    help="idle gap (min) that ends the contiguous ETA rate window")
     ap.add_argument("--no-pg", action="store_true", help="do not query Postgres")
     ap.add_argument("--pg-container", default="memmachine-postgres-dev")
     ap.add_argument("--watch", type=float, default=0, help="refresh every N seconds")
