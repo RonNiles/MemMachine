@@ -62,6 +62,23 @@ class OpenAIResponsesLanguageModelParams(BaseModel):
         description="Maximal retry interval in seconds when retrying API calls",
         gt=0,
     )
+    max_output_tokens: int | None = Field(
+        None,
+        description=(
+            "Maximum number of output tokens per request. Caps generation so a "
+            "runaway response cannot grow toward the model's full output ceiling. "
+            "If None, the provider default is used."
+        ),
+        gt=0,
+    )
+    request_timeout_seconds: float | None = Field(
+        None,
+        description=(
+            "Per-request timeout in seconds, applied via the client's "
+            "with_options(timeout=...). If None, the client default is used."
+        ),
+        gt=0,
+    )
     metrics_factory: InstanceOf[MetricsFactory] | None = Field(
         None,
         description="An instance of MetricsFactory for collecting usage metrics",
@@ -103,12 +120,17 @@ class OpenAIResponsesLanguageModel(LanguageModel):
 
         self._max_retry_interval_seconds = params.max_retry_interval_seconds
         self._reasoning_effort = params.reasoning_effort
+        self._request_timeout_seconds = params.request_timeout_seconds
 
-        # Optional sampling params spread into every API call; omitted entirely
-        # when None so the provider default is used.
+        # Optional request params spread into every API call; omitted entirely
+        # when None so the provider default is used. max_output_tokens caps the
+        # generation length so a degenerate runaway response cannot stall the
+        # caller for minutes.
         self._sampling_kwargs: dict[str, Any] = {}
         if params.temperature is not None:
             self._sampling_kwargs["temperature"] = params.temperature
+        if params.max_output_tokens is not None:
+            self._sampling_kwargs["max_output_tokens"] = params.max_output_tokens
 
         metrics_factory = params.metrics_factory
 
@@ -144,6 +166,23 @@ class OpenAIResponsesLanguageModel(LanguageModel):
                 "Number of tokens used for OpenAI language model",
             )
 
+    def _client_with_options(
+        self, *, max_retries: int | None = None
+    ) -> openai.AsyncOpenAI:
+        """Return the client with a per-request timeout (and optional retries).
+
+        Applying the timeout via ``with_options`` bounds a single API call so a
+        pathological generation is aborted rather than blocking for the OpenAI
+        client default (600s). When no timeout is configured, the client is
+        returned with only the requested retry override (if any).
+        """
+        options: dict[str, Any] = {}
+        if self._request_timeout_seconds is not None:
+            options["timeout"] = self._request_timeout_seconds
+        if max_retries is not None:
+            options["max_retries"] = max_retries
+        return self._client.with_options(**options) if options else self._client
+
     async def generate_parsed_response(
         self,
         output_format: type[T],
@@ -167,7 +206,7 @@ class OpenAIResponsesLanguageModel(LanguageModel):
             generate_response_call_uuid = uuid4()
 
             try:
-                response = await self._client.with_options(
+                response = await self._client_with_options(
                     max_retries=max_attempts,
                 ).responses.parse(
                     model=self._model,
@@ -260,14 +299,14 @@ class OpenAIResponsesLanguageModel(LanguageModel):
                         max_attempts,
                     )
                     if tools is None:
-                        response = await self._client.responses.create(
+                        response = await self._client_with_options().responses.create(
                             model=self._model,
                             input=input_prompts,
                             store=False,
                             **self._sampling_kwargs,
                         )
                     else:
-                        response = await self._client.responses.create(
+                        response = await self._client_with_options().responses.create(
                             model=self._model,
                             input=input_prompts,
                             store=False,

@@ -152,6 +152,51 @@ def test_init_invalid_metrics_factory_type(minimal_config):
 
 
 @pytest.mark.asyncio
+async def test_max_output_tokens_and_timeout_applied(mock_async_openai):
+    """max_output_tokens is forwarded to the API and the request timeout is
+    applied via with_options so a single call is bounded."""
+    config = OpenAIResponsesLanguageModelParams(
+        client=openai.AsyncOpenAI(api_key="test_api_key"),
+        model="test-model",
+        max_output_tokens=4000,
+        request_timeout_seconds=30.0,
+    )
+
+    mock_response = MagicMock()
+    mock_response.output_text = "ok"
+    mock_response.output = None
+    mock_response.usage = None
+
+    mock_client = mock_async_openai.return_value
+    # with_options returns the same mock so the configured create mock is used.
+    mock_client.with_options.return_value = mock_client
+    mock_client.responses.create.return_value = mock_response
+
+    lm = OpenAIResponsesLanguageModel(config)
+    await lm.generate_response(user_prompt="hi")
+
+    mock_client.with_options.assert_called_with(timeout=30.0)
+    create_kwargs = mock_client.responses.create.call_args.kwargs
+    assert create_kwargs["max_output_tokens"] == 4000
+
+
+def test_init_invalid_max_output_tokens_value(minimal_config):
+    """Initialization fails with non-positive max_output_tokens."""
+    with pytest.raises(ValidationError):
+        OpenAIResponsesLanguageModelParams(
+            **(minimal_config.model_dump() | {"max_output_tokens": 0}),
+        )
+
+
+def test_init_invalid_request_timeout_seconds_value(minimal_config):
+    """Initialization fails with non-positive request_timeout_seconds."""
+    with pytest.raises(ValidationError):
+        OpenAIResponsesLanguageModelParams(
+            **(minimal_config.model_dump() | {"request_timeout_seconds": 0}),
+        )
+
+
+@pytest.mark.asyncio
 async def test_generate_response_invalid_max_attempts(minimal_config):
     """Test generate_response fails with non-positive max_attempts."""
     lm = OpenAIResponsesLanguageModel(minimal_config)

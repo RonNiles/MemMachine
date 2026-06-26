@@ -54,6 +54,27 @@ class OpenAIResponsesLanguageModelConf(
         description="Maximal retry interval in seconds when retrying API calls",
         gt=0,
     )
+    max_output_tokens: int | None = Field(
+        default=8000,
+        description=(
+            "Maximum number of output tokens per request. Caps generation so a "
+            "degenerate runaway response cannot grow toward the model's full "
+            "output ceiling (and stall the ingestion loop for minutes). Size it "
+            "above normal structured-output sizes to avoid truncating valid "
+            "results. If None, the provider default is used."
+        ),
+        gt=0,
+    )
+    request_timeout_seconds: float | None = Field(
+        default=60.0,
+        description=(
+            "Per-request timeout in seconds. Hard upper bound on a single API "
+            "call so a pathological generation is aborted rather than blocking "
+            "for the OpenAI client default (600s). If None, the client default "
+            "is used."
+        ),
+        gt=0,
+    )
     temperature: float | None = Field(
         default=None,
         description=(
