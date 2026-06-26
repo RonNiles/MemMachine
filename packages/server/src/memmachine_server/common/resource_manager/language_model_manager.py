@@ -262,6 +262,8 @@ class LanguageModelManager(BaseResourceManager[LanguageModel]):
                 ),
                 model=conf.model,
                 max_retry_interval_seconds=conf.max_retry_interval_seconds,
+                max_output_tokens=conf.max_output_tokens,
+                request_timeout_seconds=conf.request_timeout_seconds,
                 metrics_factory=conf.get_metrics_factory(),
                 temperature=conf.temperature,
             ),
