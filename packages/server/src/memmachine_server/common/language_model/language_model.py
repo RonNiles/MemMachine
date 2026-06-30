@@ -48,6 +48,33 @@ class LanguageModel(ABC):
         """
         raise NotImplementedError
 
+    async def generate_parsed_response_with_token_usage(
+        self,
+        output_format: type[T],
+        system_prompt: str | None = None,
+        user_prompt: str | None = None,
+        max_attempts: int = 1,
+    ) -> tuple[T | None, int, int]:
+        """
+        Like ``generate_parsed_response`` but also report token usage.
+
+        The default implementation delegates to ``generate_parsed_response``
+        and reports zero tokens. Providers that can surface usage from their
+        API response should override this to return real input/output counts.
+
+        Returns:
+            tuple[T | None, int, int]:
+                The parsed response (or None on parse/refusal failure),
+                the LLM input token count, and the LLM output token count.
+        """
+        result = await self.generate_parsed_response(
+            output_format=output_format,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            max_attempts=max_attempts,
+        )
+        return result, 0, 0
+
     @abstractmethod
     async def generate_response(
         self,

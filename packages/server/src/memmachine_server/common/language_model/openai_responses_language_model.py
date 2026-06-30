@@ -191,6 +191,22 @@ class OpenAIResponsesLanguageModel(LanguageModel):
         max_attempts: int = 1,
     ) -> T | None:
         """Generate a structured response parsed into the given model."""
+        result, _, _ = await self.generate_parsed_response_with_token_usage(
+            output_format=output_format,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            max_attempts=max_attempts,
+        )
+        return result
+
+    async def generate_parsed_response_with_token_usage(
+        self,
+        output_format: type[T],
+        system_prompt: str | None = None,
+        user_prompt: str | None = None,
+        max_attempts: int = 1,
+    ) -> tuple[T | None, int, int]:
+        """Structured parse that also reports input/output token usage."""
         async with self._tracker("generate_parsed_response"):
             if max_attempts <= 0:
                 raise ValueError("max_attempts must be a positive integer")
@@ -225,8 +241,13 @@ class OpenAIResponsesLanguageModel(LanguageModel):
                 raise ExternalServiceAPIError(error_message) from e
 
             self._collect_usage_metrics(response)
+            self._warn_if_truncated(response, generate_response_call_uuid)
 
-            return response.output_parsed
+            return (
+                response.output_parsed,
+                response.usage.input_tokens if response.usage else 0,
+                response.usage.output_tokens if response.usage else 0,
+            )
 
     async def generate_response(
         self,
@@ -363,6 +384,7 @@ class OpenAIResponsesLanguageModel(LanguageModel):
                 raise RuntimeError("OpenAI response was not generated")
 
             self._collect_usage_metrics(response)
+            self._warn_if_truncated(response, generate_response_call_uuid)
 
             if response.output is None:
                 return (response.output_text or "", [], 0, 0)
@@ -393,6 +415,30 @@ class OpenAIResponsesLanguageModel(LanguageModel):
                 response.usage.input_tokens if response.usage else 0,
                 response.usage.output_tokens if response.usage else 0,
             )
+
+    def _warn_if_truncated(self, response: Response, call_uuid: object) -> None:
+        """Log a warning when a response was cut short rather than completed.
+
+        A generation truncated at ``max_output_tokens`` (or otherwise stopped
+        early) comes back with ``status == "incomplete"`` instead of raising,
+        so without this check a partial response is silently returned — and,
+        once the model is wrapped by the cache, persisted as if it were a
+        complete result.
+        """
+        if response.status != "incomplete":
+            return
+        reason = (
+            response.incomplete_details.reason
+            if response.incomplete_details is not None
+            else None
+        )
+        logger.warning(
+            "[call uuid: %s] %s response is incomplete (reason=%s); "
+            "output was truncated and may be partial.",
+            call_uuid,
+            self._model,
+            reason,
+        )
 
     def _collect_usage_metrics(self, response: Response) -> None:
         if not self._should_collect_metrics:
