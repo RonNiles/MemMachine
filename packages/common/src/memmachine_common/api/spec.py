@@ -627,6 +627,14 @@ class SearchMemoriesSpec(_WithOrgAndProj):
             description=SpecDoc.FEATURE_LOAD_CITATIONS,
         ),
     ]
+    # Flags for using Hybrid Search (Vector + Full-Text Search)
+    use_fts: Annotated[
+        bool,
+        Field(
+            default=False,
+            description="Use Full-Text Search (keyword search) with Vector Search",
+        ),
+    ]
 
 
 class IngestionStatusSpec(_WithOrgAndProj):
