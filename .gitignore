@@ -228,3 +228,7 @@ site/
 llm_cache.db
 llm_cache.db-wal
 llm_cache.db-shm
+
+# incremental replication runtime state (scripts/db-sync-*.sh)
+.sync-state/
+.sync-state-remote/
