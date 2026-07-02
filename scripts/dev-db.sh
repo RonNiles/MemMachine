@@ -68,6 +68,7 @@ up() {
       -p 7474:7474 -p 7687:7687 \
       -e NEO4J_AUTH="${NEO_USER}/${NEO_PASS}" \
       -e NEO4J_PLUGINS='["apoc","graph-data-science"]' \
+      -e NEO4J_apoc_export_file_enabled=true \
       -e NEO4J_server_memory_heap_initial__size=512m \
       -e NEO4J_server_memory_heap_max__size=1G \
       -v mm-neo4j-data:/data \
