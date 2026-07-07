@@ -4,6 +4,8 @@ import time
 from collections.abc import AsyncIterator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 
+from memmachine_server.common import stage_timing
+
 from .metrics_factory import MetricsFactory
 
 
@@ -26,6 +28,7 @@ class OperationTracker:
         prefix: str,
     ) -> None:
         """Register a single latency histogram for all operations."""
+        self._prefix = prefix
         self._histogram: MetricsFactory.Histogram | None = None
         if factory is not None:
             self._histogram = factory.get_histogram(
@@ -56,3 +59,8 @@ class OperationTracker:
                 value=elapsed,
                 labels={"operation": operation, "status": status},
             )
+        # Also feed the opt-in stage-timing CSV (no-op unless enabled). This
+        # gives every OperationTracker user free coverage in the ingestion
+        # performance report without touching each call site.
+        if stage_timing.enabled():
+            stage_timing.record(f"{self._prefix}.{operation}", elapsed, status)
