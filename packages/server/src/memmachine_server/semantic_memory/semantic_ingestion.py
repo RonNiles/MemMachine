@@ -9,6 +9,7 @@ from itertools import chain
 import numpy as np
 from pydantic import BaseModel, Field, InstanceOf, TypeAdapter
 
+from memmachine_server.common import stage_timing
 from memmachine_server.common.embedder import Embedder
 from memmachine_server.common.episode_store import Episode, EpisodeIdT, EpisodeStorage
 from memmachine_server.common.filter.filter_parser import And, Comparison
@@ -138,7 +139,8 @@ class IngestionService:
     async def process_set_ids(self, set_ids: list[SetIdT]) -> None:
         async def _run(set_id: SetIdT) -> None:
             try:
-                await self._process_single_set(set_id)
+                async with stage_timing.atimed("semantic.process_set"):
+                    await self._process_single_set(set_id)
             except Exception:
                 logger.exception("Failed to process set_id %s", set_id)
                 raise
@@ -218,106 +220,140 @@ class IngestionService:
 
         logger.debug("Processing %d messages for set %s", len(messages), set_id)
 
-        async def process_semantic_type(
-            semantic_category: InstanceOf[SemanticCategory],
-        ) -> None:
-            for message in messages:
-                if message.uid is None:
-                    logger.error(
-                        "Message ID is None for message %s", message.model_dump()
-                    )
-
-                    raise ValueError(
-                        f"Message ID is None for message {message.model_dump()}"
-                    )
-
-                filter_expr = And(
-                    left=Comparison(field="set_id", op="=", value=set_id),
-                    right=Comparison(
-                        field="category", op="=", value=semantic_category.name
-                    ),
+        processed_count = 0
+        for message in messages:
+            if message.uid is None:
+                logger.error(
+                    "Message ID is None for message %s", message.model_dump()
                 )
 
-                features = await self._fetch_old_profile_features(filter_expr)
-
-                try:
-                    commands = await llm_feature_update(
-                        features=features,
-                        message_content=message.content,
-                        model=resources.language_model,
-                        update_prompt=semantic_category.prompt.update_prompt,
-                        deterministic=self._deterministic_ingestion,
-                    )
-                except Exception as err:
-                    if _is_context_length_exceeded_error(err):
-                        logger.warning(
-                            "Skipping message %s for semantic type %s due to non-retryable context length error",
-                            message.uid,
-                            semantic_category.name,
-                        )
-                        if message.uid not in mark_messages:
-                            mark_messages.append(message.uid)
-                        continue
-
-                    logger.exception(
-                        "Failed to process message %s for semantic type %s",
-                        message.uid,
-                        semantic_category.name,
-                    )
-                    if self._debug_fail_loudly:
-                        raise
-
-                    continue
-
-                await self._apply_commands(
-                    commands=commands,
-                    set_id=set_id,
-                    category_name=semantic_category.name,
-                    citation_id=message.uid,
-                    embedder=resources.embedder,
+                raise ValueError(
+                    f"Message ID is None for message {message.model_dump()}"
                 )
 
-                mark_messages.append(message.uid)
-
-                if self._deterministic_ingestion:
-                    # Consolidate after every message so consolidation LLM
-                    # calls trigger at points determined only by the message
-                    # sequence, not by where polling-cycle windows land.
-                    await self._consolidate_category(
+            # Process every category for this message, then mark the message
+            # ingested in its own commit before moving on. Marking per message
+            # (rather than once per whole batch) bounds crash/stop reprocessing
+            # to at most the single in-flight message: any message already
+            # marked is never reprocessed, so a stopped-and-resumed run
+            # reproduces the same feature lineage as a continuous run. That
+            # determinism is what makes the LLM cache reusable across the
+            # incremental runs used to build it. Categories are independent
+            # (each filters on its own semantic_category_id and writes disjoint
+            # rows), so processing them per message instead of per batch does
+            # not change any prompt.
+            results = await asyncio.gather(
+                *[
+                    self._process_message_for_category(
+                        message=message,
+                        semantic_category=t,
                         set_id=set_id,
-                        semantic_category=semantic_category,
                         resources=resources,
                     )
+                    for t in resources.semantic_categories
+                ]
+            )
 
-        mark_messages: list[EpisodeIdT] = []
-        semantic_category_runners = []
-        for t in resources.semantic_categories:
-            task = process_semantic_type(t)
-            semantic_category_runners.append(task)
-
-        await asyncio.gather(*semantic_category_runners)
+            # Only mark ingested once every category handled the message
+            # (success or a non-retryable skip). If any category hit a retryable
+            # failure, leave the message un-ingested so it is retried next cycle.
+            if all(results):
+                await self._semantic_storage.mark_messages_ingested(
+                    set_id=set_id,
+                    history_ids=[message.uid],
+                )
+                processed_count += 1
+                # Advance the progress axis the stage-timing report keys on.
+                # No-op unless stage timing is enabled.
+                stage_timing.bump(stage_timing.PRIMARY_COUNTER, 1)
 
         logger.debug(
             "Finished processing %d messages out of %d for set %s",
-            len(mark_messages),
+            processed_count,
             len(messages),
             set_id,
         )
 
-        if len(mark_messages) == 0:
-            return
-
-        await self._semantic_storage.mark_messages_ingested(
-            set_id=set_id,
-            history_ids=mark_messages,
-        )
-
         # In deterministic mode consolidation already ran per message.
-        if not self._deterministic_ingestion:
+        if not self._deterministic_ingestion and processed_count > 0:
             await self._consolidate_set_memories_if_applicable(
                 set_id=set_id,
                 resources=resources,
             )
+
+    async def _process_message_for_category(
+        self,
+        *,
+        message: Episode,
+        semantic_category: InstanceOf[SemanticCategory],
+        set_id: SetIdT,
+        resources: InstanceOf[Resources],
+    ) -> bool:
+        """Ingest one message into one semantic category.
+
+        Returns ``True`` when the message is fully handled for this category
+        (extraction succeeded, or was skipped for a non-retryable reason such
+        as an over-length context) and may therefore be marked ingested;
+        ``False`` when a retryable failure means it should be reprocessed on a
+        later cycle. Raises when ``debug_fail_loudly`` is set.
+        """
+        filter_expr = And(
+            left=Comparison(field="set_id", op="=", value=set_id),
+            right=Comparison(field="category", op="=", value=semantic_category.name),
+        )
+
+        async with stage_timing.atimed("semantic.fetch_old_profile"):
+            features = await self._fetch_old_profile_features(filter_expr)
+
+        try:
+            async with stage_timing.atimed("semantic.llm_feature_update"):
+                commands = await llm_feature_update(
+                    features=features,
+                    message_content=message.content,
+                    model=resources.language_model,
+                    update_prompt=semantic_category.prompt.update_prompt,
+                    deterministic=self._deterministic_ingestion,
+                )
+        except Exception as err:
+            if _is_context_length_exceeded_error(err):
+                logger.warning(
+                    "Skipping message %s for semantic type %s due to non-retryable context length error",
+                    message.uid,
+                    semantic_category.name,
+                )
+                return True
+
+            logger.exception(
+                "Failed to process message %s for semantic type %s",
+                message.uid,
+                semantic_category.name,
+            )
+            if self._debug_fail_loudly:
+                raise
+
+            return False
+
+        async with stage_timing.atimed("semantic.apply_commands"):
+            await self._apply_commands(
+                commands=commands,
+                set_id=set_id,
+                category_name=semantic_category.name,
+                citation_id=message.uid,
+                embedder=resources.embedder,
+            )
+
+        if self._deterministic_ingestion:
+            # Consolidate after every message so consolidation LLM calls
+            # trigger at points determined only by the message sequence, not by
+            # where polling-cycle windows land.
+            async with stage_timing.atimed("semantic.consolidate_category"):
+                await self._consolidate_category(
+                    set_id=set_id,
+                    semantic_category=semantic_category,
+                    resources=resources,
+                )
+
+        return True
 
     async def _fetch_old_profile_features(
         self, filter_expr: And
@@ -514,14 +550,15 @@ class IngestionService:
             ),
         )
 
-        features = [
-            f
-            async for f in self._semantic_storage.get_feature_set(
-                filter_expr=filter_expr,
-                tag_threshold=self._consolidation_threshold,
-                load_citations=True,
-            )
-        ]
+        async with stage_timing.atimed("semantic.consolidate_fetch"):
+            features = [
+                f
+                async for f in self._semantic_storage.get_feature_set(
+                    filter_expr=filter_expr,
+                    tag_threshold=self._consolidation_threshold,
+                    load_citations=True,
+                )
+            ]
 
         consolidation_sections: list[Sequence[SemanticFeature]] = list(
             SemanticFeature.group_features_by_tag(features).values(),

@@ -35,6 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import (
     DeclarativeBase,
     aliased,
+    defer,
     mapped_column,
 )
 from sqlalchemy.sql import Delete, Select, func
@@ -116,7 +117,20 @@ class Feature(BaseSemanticStorage):
 
     __table_args__ = (
         Index("idx_feature_set_id", "set_id"),
-        Index("idx_feature_set_id_semantic_category", "set_id", "semantic_category_id"),
+        # Covers the profile-fetch/consolidation hot path:
+        #   WHERE set_id = ? AND semantic_category_id = ?
+        #   ORDER BY created_at, id
+        # The trailing created_at, id serve the ORDER BY so Postgres returns
+        # rows pre-sorted (no Sort node / external merge to disk). This index
+        # is a strict superset-prefix of the former two-column
+        # idx_feature_set_id_semantic_category, which it replaces.
+        Index(
+            "idx_feature_set_semantic_category_created_id",
+            "set_id",
+            "semantic_category_id",
+            "created_at",
+            "id",
+        ),
         Index(
             "idx_feature_set_semantic_category_tag",
             "set_id",
@@ -308,7 +322,11 @@ class SqlAlchemyPgVectorSemanticStorage(SemanticStorage):
         except (TypeError, ValueError) as e:
             raise ResourceNotFoundError(f"Invalid feature ID: {feature_id}") from e
 
-        stmt = select(Feature).where(Feature.id == feature_id_int)
+        stmt = (
+            select(Feature)
+            .where(Feature.id == feature_id_int)
+            .options(defer(Feature.embedding))
+        )
 
         async with self._create_session() as session:
             result = await session.execute(stmt)
@@ -336,7 +354,13 @@ class SqlAlchemyPgVectorSemanticStorage(SemanticStorage):
         load_citations: bool = False,
         filter_expr: FilterExpr | None = None,
     ) -> AsyncIterator[SemanticFeature]:
-        stmt = select(Feature)
+        # Defer the embedding: it is a 1536-dim (~6 KB, TOASTed) column that
+        # ``to_typed_model`` never reads, so loading it per row is pure waste on
+        # the whole-profile ingestion reads. ``defer`` keeps the ORM objects
+        # intact (embedding is loaded lazily only if accessed, which never
+        # happens here) and does not affect vector-search SQL, which references
+        # the column as an expression rather than loading the attribute.
+        stmt = select(Feature).options(defer(Feature.embedding))
 
         stmt = self._apply_feature_filter(
             stmt,
