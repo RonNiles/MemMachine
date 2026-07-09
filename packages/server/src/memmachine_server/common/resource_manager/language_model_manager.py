@@ -226,17 +226,32 @@ class LanguageModelManager(BaseResourceManager[LanguageModel]):
                 base_url=conf.base_url,
                 temperature=conf.temperature,
             )
-        bedrock_conf = self.conf.amazon_bedrock_language_model_confs[name]
-        return LLMCacheStore.model_signature(
-            provider="amazon-bedrock",
-            model_id=bedrock_conf.model_id,
-            region=bedrock_conf.region,
-            inference_config=(
-                bedrock_conf.inference_config.model_dump()
-                if bedrock_conf.inference_config is not None
-                else None
-            ),
-            additional_model_request_fields=bedrock_conf.additional_model_request_fields,
+        if name in self.conf.litellm_language_model_confs:
+            litellm_conf = self.conf.litellm_language_model_confs[name]
+            # api_key is a credential and is intentionally excluded from the signature.
+            return LLMCacheStore.model_signature(
+                provider="litellm",
+                model=litellm_conf.model,
+                api_base=litellm_conf.api_base,
+                api_version=litellm_conf.api_version,
+                drop_params=litellm_conf.drop_params,
+                extra_kwargs=litellm_conf.extra_kwargs,
+            )
+        if name in self.conf.amazon_bedrock_language_model_confs:
+            bedrock_conf = self.conf.amazon_bedrock_language_model_confs[name]
+            return LLMCacheStore.model_signature(
+                provider="amazon-bedrock",
+                model_id=bedrock_conf.model_id,
+                region=bedrock_conf.region,
+                inference_config=(
+                    bedrock_conf.inference_config.model_dump()
+                    if bedrock_conf.inference_config is not None
+                    else None
+                ),
+                additional_model_request_fields=bedrock_conf.additional_model_request_fields,
+            )
+        raise InvalidLanguageModelError(
+            f"Cannot build cache signature: language model '{name}' not found."
         )
 
     def _build_openai_responses_language_model(self, name: str) -> LanguageModel:

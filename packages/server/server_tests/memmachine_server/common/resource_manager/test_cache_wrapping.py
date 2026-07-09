@@ -11,6 +11,7 @@ from memmachine_server.common.configuration.embedder_conf import (
 )
 from memmachine_server.common.configuration.language_model_conf import (
     LanguageModelsConf,
+    LiteLLMLanguageModelConf,
     OpenAIChatCompletionsLanguageModelConf,
 )
 from memmachine_server.common.embedder.caching_embedder import CachingEmbedder
@@ -75,3 +76,17 @@ async def test_language_model_not_wrapped_without_cache() -> None:
     mgr = LanguageModelManager(_language_models_conf())
     model = await mgr.get_language_model("m")
     assert isinstance(model, OpenAIChatCompletionsLanguageModel)
+
+
+def test_litellm_cache_signature(tmp_path: Path) -> None:
+    """A litellm model yields a cache signature instead of a bedrock KeyError."""
+    conf = LanguageModelsConf(
+        litellm_language_model_confs={
+            "l": LiteLLMLanguageModelConf(model="anthropic/claude-sonnet-5")
+        }
+    )
+    store = LLMCacheStore(str(tmp_path / "cache.db"))
+    mgr = LanguageModelManager(conf, cache_store=store)
+    signature = mgr._language_model_signature("l")
+    assert "litellm" in signature
+    assert "anthropic/claude-sonnet-5" in signature
