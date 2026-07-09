@@ -850,6 +850,36 @@ class VectorStoreSemanticStorage(SemanticStorage):
         )
         return properties
 
+    async def get_oldest_pending_history_at(
+        self,
+        set_id: SetIdT,
+    ) -> datetime | None:
+        """Return the oldest un-ingested history timestamp for a set, or None."""
+        stmt = select(func.min(VectorSemanticSetIngestedHistory.created_at)).where(
+            VectorSemanticSetIngestedHistory.set_id == set_id,
+            VectorSemanticSetIngestedHistory.ingested.is_(False),
+        )
+        async with self._create_session() as session:
+            result = await session.execute(stmt)
+            return result.scalar_one_or_none()
+
+    async def get_feature_counts_by_category(
+        self,
+        set_id: SetIdT,
+    ) -> Mapping[str, int]:
+        """Return feature counts grouped by category name for a single set."""
+        stmt = (
+            select(
+                VectorSemanticFeature.semantic_category_id,
+                func.count(VectorSemanticFeature.id),
+            )
+            .where(VectorSemanticFeature.set_id == set_id)
+            .group_by(VectorSemanticFeature.semantic_category_id)
+        )
+        async with self._create_session() as session:
+            result = await session.execute(stmt)
+            return {category: int(count) for category, count in result.all()}
+
     @staticmethod
     def _coerce_feature_id(feature_id: FeatureIdT) -> int:
         try:
