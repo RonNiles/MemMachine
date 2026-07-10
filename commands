@@ -1,0 +1,24 @@
+scripts/dev-db.sh logs
+scripts/dev-db.sh down
+scripts/dev-db.sh reset
+scripts/dev-db.sh up
+export MEMMACHINE_STAGE_TIMING_CSV=./stage_timing.csv; export MEMMACHINE_STAGE_TIMING_EVERY=100; export MEMMACHINE_STAGE_TIMING_INTERVAL_SEC=30
+uv run memmachine-server
+sqlite3 llm_cache.db "select count(*) from llm_cache;"
+sqlite3 llm_cache.db "select count(*) from embedding_cache;"
+sqlite3 llm_cache.db "select max(created_at) from llm_cache;"
+NUM_HOURS=48 ./sqlite3-by-hour.sh
+uv run tools/ingest_monitor.py
+docker exec memmachine-neo4j-dev cypher-shell -u neo4j -p neo4j_password --format plain "MATCH (n) WHERE any(l IN labels(n) WHERE l STARTS WITH 'SANITIZED_Episode_u5f_') RETURN n.uid AS uid";
+docker exec memmachine-neo4j-dev cypher-shell -u neo4j -p neo4j_password --format plain "MATCH (n) RETURN COUNT(*);"
+docker exec memmachine-postgres-dev psql -U memmachine -d memmachine -t -A -c "select count(*) from episodestore;"
+docker exec memmachine-postgres-dev psql -U memmachine -d memmachine -t -A -c "SELECT count(*) FROM set_ingested_history WHERE NOT ingested;"
+uv run python tools/stage_timing_report.py stage_timing.csv
+cat stage_timing.csv | cut -d, -f5- | sort -t, -k1,1 -k3,3n
+
+scripts/db-backup.sh backup ~/MemMachine-0.3.8/backup 2>&1
+tar cvzf backup.tgz backup/
+aws s3 ls --recursive s3://rn2192-backup
+aws s3 rm s3://rn2192-backup/backup.tgz
+aws s3 cp backup.tgz s3://rn2192-backup
+
