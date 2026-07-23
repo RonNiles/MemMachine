@@ -61,6 +61,11 @@ from memmachine_server.episodic_memory.event_memory.segmenter import Segmenter
 
 logger = logging.getLogger(__name__)
 
+# Dampening constant for Reciprocal Rank Fusion of the vector and FTS legs in
+# hybrid search. Matches the default in RRFHybridReranker; 60 is the value from
+# the original RRF paper.
+_HYBRID_RRF_K = 60
+
 # Stable namespace for deterministic Episode.uid -> Event.uuid mapping. Do not
 # change without a data migration.
 _EVENT_UUID_NAMESPACE = UUID("8c2c0e0a-3a2f-4b9c-9d1f-9b6c2a3a4f7e")
@@ -301,53 +306,77 @@ class LongTermMemory:
         score_threshold: float | None,
         property_filter: FilterExpr | None,
     ) -> list[tuple[float, Episode]]:
-        """Hybrid search: Vector (reranked via RRF) + FTS Top-10 with dedup.
+        """Hybrid search: Reciprocal Rank Fusion (RRF) of the vector + FTS legs.
 
-        Vector search results (already reranked with RRF by _search_scored_declarative)
-        are combined with FTS Top-10 results after removing duplicates (by episode uid).
+        The vector leg (reranked by ``_search_scored_declarative``) and the FTS
+        leg (ranked by Lucene relevance) produce two independently-ordered lists
+        on incommensurable score scales. Rather than appending FTS after vector
+        — which keeps FTS out of the top-k whenever the vector leg alone fills
+        it — both lists are fused by RRF so each signal competes for every slot:
+        an episode's fused score is the sum, over the lists it appears in, of
+        ``1 / (_HYBRID_RRF_K + rank)`` (1-based rank). Episodes matched by both
+        legs rank highest. The returned score is therefore an RRF score
+        (higher-is-better), not a vector or Lucene score.
 
-        Returns up to num_episodes_limit + 10 results (e.g., 50 + 10 = 60 max).
+        Returns up to num_episodes_limit results ordered by fused score.
         """
         assert self._declarative_memory is not None
 
-        # 1. Run Vector Search and FTS in parallel
-        # _search_scored_declarative already returns RRF reranked results
-        # _search_fts over-fetches 5x for FTS Top-10 (50 items)
-        vector_results, fts_results_full = await asyncio.gather(
+        # Run both legs concurrently, each returning an independently ranked
+        # list. score_threshold is applied post-fusion, so both legs run
+        # unthresholded here.
+        vector_results, fts_results = await asyncio.gather(
             self._search_scored_declarative(
                 query,
                 num_episodes_limit=num_episodes_limit,
                 expand_context=expand_context,
-                score_threshold=None,  # Apply threshold after merge
+                score_threshold=None,
                 property_filter=property_filter,
             ),
             self._search_fts(
                 query,
-                num_episodes_limit=10,  # FTS Top-10 (over-fetch 5x = 50 internally)
+                num_episodes_limit=num_episodes_limit,
             ),
         )
 
-        # 2. Limit FTS results to Top-10 by score (descending order)
-        fts_top_10 = fts_results_full[:10]
+        # Fuse the two ranked lists. Vector is passed first so its (richer)
+        # Episode instance wins for a uid present in both legs.
+        fused = LongTermMemory._rrf_fuse([vector_results, fts_results])
 
-        # 3. Merge FTS Top-10 into Vector results with dedup by episode uid
-        # Preserve vector result order, append unique FTS results
-        merged_results = list(vector_results)
-        seen_uids = {ep.uid for _, ep in merged_results}
-
-        for score, episode in fts_top_10:
-            if episode.uid not in seen_uids:
-                merged_results.append((score, episode))
-                seen_uids.add(episode.uid)
-
-        # 4. Apply score threshold
         if score_threshold is not None:
-            merged_results = [
-                (score, episode)
-                for score, episode in merged_results
-                if score >= score_threshold
+            fused = [
+                (score, episode) for score, episode in fused if score >= score_threshold
             ]
-        return merged_results
+        return fused[:num_episodes_limit]
+
+    @staticmethod
+    def _rrf_fuse(
+        ranked_lists: Iterable[list[tuple[float, Episode]]],
+        *,
+        k: int = _HYBRID_RRF_K,
+    ) -> list[tuple[float, Episode]]:
+        """Fuse independently-ranked (score, Episode) lists via Reciprocal Rank Fusion.
+
+        Each episode's fused score is the sum, over the lists it appears in, of
+        ``1 / (k + rank)`` (1-based rank). Deduplicates by ``Episode.uid``,
+        keeping the first Episode instance seen for a uid — pass the
+        highest-quality list first. Input list ordering (not the input scores)
+        is what drives fusion. Returns (fused_score, Episode) ordered by fused
+        score descending.
+        """
+        fused_scores: dict[str, float] = {}
+        episodes_by_uid: dict[str, Episode] = {}
+        for ranked_list in ranked_lists:
+            for rank, (_, episode) in enumerate(ranked_list, start=1):
+                fused_scores[episode.uid] = fused_scores.get(episode.uid, 0.0) + 1.0 / (
+                    k + rank
+                )
+                episodes_by_uid.setdefault(episode.uid, episode)
+        return sorted(
+            ((fused_scores[uid], episode) for uid, episode in episodes_by_uid.items()),
+            key=lambda scored: scored[0],
+            reverse=True,
+        )
 
     @staticmethod
     def _escape_lucene_query(query: str) -> str:
