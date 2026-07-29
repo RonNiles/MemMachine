@@ -31,7 +31,7 @@ from memmachine_server.episodic_memory.declarative_memory import (
 )
 
 
-async def main():
+async def main():  # noqa: C901 - linear setup + ingest loop; complexity is inherent
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--data-path", required=True, help="Path to the data file")
@@ -68,6 +68,13 @@ async def main():
         help="Path to an LLM cache SQLite file (e.g. ../../llm_cache.db) to cache "
         "embeddings across runs. Omit to disable. Re-ingesting the same content "
         "then skips the embedding provider calls (cache hits).",
+    )
+    parser.add_argument(
+        "--max-question-attempts",
+        type=int,
+        default=3,
+        help="Retry each question up to N times on transient failures (e.g. an "
+        "embedding 404) before skipping it, so one blip can't abort a long run.",
     )
     args = parser.parse_args()
 
@@ -170,18 +177,43 @@ async def main():
 
     session_semaphore = asyncio.Semaphore(args.session_concurrency)
 
+    async def delete_question_data(question_id: str) -> None:
+        # Drop any partial Episode/Derivative collections for one question so a
+        # retry starts clean (each run mints fresh uids, so leftovers would
+        # duplicate) and a skipped question leaves no partial haystack behind.
+        for prefix in ("Episode_", "Derivative_"):
+            label = Neo4jVectorGraphStore._sanitize_name(f"{prefix}{question_id}")  # noqa: SLF001
+            await neo4j_driver.execute_query(f"MATCH (n:`{label}`) DETACH DELETE n")
+
     # Stream one question at a time so the multi-GB dataset is never fully
     # resident (json.load on the ~2.6 GB M split alone exhausts RAM). Questions
     # are ingested sequentially; the session semaphore bounds concurrency
-    # within each question.
+    # within each question. Each question is retried on transient failures
+    # (e.g. an anomalous embedding 404) so one blip can't abort the whole run.
     count = 0
+    skipped: list[str] = []
     for question in iter_longmemeval_dataset(
         data_path, limit=args.limit, sample=args.sample
     ):
-        await process_conversation(question)
+        for attempt in range(1, args.max_question_attempts + 1):
+            try:
+                await process_conversation(question)
+                break
+            except Exception as exc:
+                print(
+                    f"[warn] question {question.question_id} attempt "
+                    f"{attempt}/{args.max_question_attempts} failed: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                await delete_question_data(question.question_id)
+                if attempt == args.max_question_attempts:
+                    skipped.append(question.question_id)
         count += 1
-        print(f"ingested {count} questions (last: {question.question_id})", flush=True)
-    print(f"Done: {count} questions ingested")
+        print(f"processed {count} questions (last: {question.question_id})", flush=True)
+    print(f"Done: {count} processed, {len(skipped)} skipped after retries")
+    if skipped:
+        print(f"SKIPPED question_ids: {skipped}", flush=True)
 
     if cache_store is not None:
         await cache_store.close()
