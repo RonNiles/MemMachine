@@ -763,11 +763,17 @@ class LongTermMemory:
             uid=dm.uid,
             sequence_num=cast("int", dm.filterable_properties.get("sequence_num", 0)),
             session_key=cast("str", dm.filterable_properties.get("session_key", "")),
+            # Default when absent: episodes ingested via the low-level
+            # DeclarativeMemory API (e.g. eval harnesses) don't carry these
+            # server-set filterable properties. The full server always sets
+            # them, so its behavior is unchanged.
             episode_type=EpisodeType(
-                cast("str", dm.filterable_properties.get("episode_type", "")),
+                cast("str", dm.filterable_properties.get("episode_type"))
+                or EpisodeType.MESSAGE.value,
             ),
             content_type=ContentType(
-                cast("str", dm.filterable_properties.get("content_type", "")),
+                cast("str", dm.filterable_properties.get("content_type"))
+                or ContentType.STRING.value,
             ),
             content=dm.content,
             created_at=dm.timestamp,

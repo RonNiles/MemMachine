@@ -11,6 +11,8 @@ from longmemeval_models import (
     LongMemEvalItem,
     iter_longmemeval_dataset,
 )
+from memmachine_server.common.cache.llm_cache_store import LLMCacheStore
+from memmachine_server.common.embedder.caching_embedder import CachingEmbedder
 from memmachine_server.common.embedder.openai_embedder import (
     OpenAIEmbedder,
     OpenAIEmbedderParams,
@@ -52,6 +54,13 @@ async def main():
         action="store_true",
         help="Disable per-sentence chunking (~5x less memory/disk, ~1-2%% lower scores)",
     )
+    parser.add_argument(
+        "--embedding-cache",
+        default=None,
+        help="Path to an LLM cache SQLite file (e.g. ../../llm_cache.db) to cache "
+        "embeddings across runs. Omit to disable. Re-ingesting the same content "
+        "then skips the embedding provider calls (cache hits).",
+    )
 
     args = parser.parse_args()
 
@@ -85,6 +94,24 @@ async def main():
             max_input_length=2048,
         )
     )
+
+    # Optionally wrap the embedder with the persistent LLM cache so identical
+    # inputs are served from disk instead of re-calling the provider. The
+    # signature mirrors this embedder's config, so cache hits return vectors
+    # computed the same way; to share with a running server's cache, its
+    # `openai_embedder` config must match these fields exactly.
+    cache_store: LLMCacheStore | None = None
+    if args.embedding_cache:
+        cache_store = LLMCacheStore(args.embedding_cache)
+        await cache_store.startup()
+        signature = LLMCacheStore.model_signature(
+            provider="openai",
+            model="text-embedding-3-small",
+            dimensions=1536,
+            max_input_length=2048,
+        )
+        embedder = CachingEmbedder(embedder, signature, cache_store)
+        print(f"Embedding cache enabled: {args.embedding_cache}", flush=True)
 
     # "No reranker": IdentityReranker preserves order (declarative memory still
     # requires a reranker object; this one does no reordering).
@@ -146,6 +173,9 @@ async def main():
         count += 1
         print(f"ingested {count} questions (last: {question.question_id})", flush=True)
     print(f"Done: {count} questions ingested")
+
+    if cache_store is not None:
+        await cache_store.close()
 
 
 if __name__ == "__main__":
