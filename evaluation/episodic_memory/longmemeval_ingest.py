@@ -39,8 +39,16 @@ async def main():
         "--limit",
         type=int,
         default=None,
-        help="Ingest only the first N questions (subset for faster A/B runs). "
-        "Use the same --limit for the search step.",
+        help="Ingest only the FIRST N questions. NOTE: the dataset is grouped by "
+        "question_type, so first-N is all one type — smoke tests only. For a "
+        "representative subset use --sample. Use the same value for search.",
+    )
+    parser.add_argument(
+        "--sample",
+        type=int,
+        default=None,
+        help="Ingest N evenly-spaced questions spanning all question types "
+        "(representative subset). Use the same --sample for the search step.",
     )
     parser.add_argument(
         "--session-concurrency",
@@ -61,7 +69,6 @@ async def main():
         "embeddings across runs. Omit to disable. Re-ingesting the same content "
         "then skips the embedding provider calls (cache hits).",
     )
-
     args = parser.parse_args()
 
     data_path = args.data_path
@@ -168,7 +175,9 @@ async def main():
     # are ingested sequentially; the session semaphore bounds concurrency
     # within each question.
     count = 0
-    for question in iter_longmemeval_dataset(data_path, limit=args.limit):
+    for question in iter_longmemeval_dataset(
+        data_path, limit=args.limit, sample=args.sample
+    ):
         await process_conversation(question)
         count += 1
         print(f"ingested {count} questions (last: {question.question_id})", flush=True)

@@ -67,10 +67,16 @@ async def main():
         "--limit",
         type=int,
         default=None,
-        help="Query only the first N questions. Must match the --limit used at "
-        "ingest time (search only works for ingested questions).",
+        help="Query only the FIRST N questions (all one question_type; smoke "
+        "tests only). Must match the --limit used at ingest time.",
     )
-
+    parser.add_argument(
+        "--sample",
+        type=int,
+        default=None,
+        help="Query N evenly-spaced questions spanning all question types. Must "
+        "match the --sample used at ingest time.",
+    )
     args = parser.parse_args()
 
     data_path = args.data_path
@@ -215,7 +221,9 @@ async def main():
     max_outstanding = 10
     results = []
     in_flight: set = set()
-    for question in iter_longmemeval_dataset(data_path, limit=args.limit):
+    for question in iter_longmemeval_dataset(
+        data_path, limit=args.limit, sample=args.sample
+    ):
         in_flight.add(
             asyncio.create_task(async_with(semaphore, process_question(question)))
         )

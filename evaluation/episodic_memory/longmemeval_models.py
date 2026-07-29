@@ -114,7 +114,9 @@ def load_longmemeval_dataset(file_path: str) -> list[LongMemEvalItem]:
     return [LongMemEvalItem(**item) for item in raw_data]
 
 
-def iter_longmemeval_dataset(file_path: str, limit: int | None = None):
+def iter_longmemeval_dataset(
+    file_path: str, limit: int | None = None, sample: int | None = None
+):
     """Yield LongMemEvalItem objects one at a time, streaming (constant memory).
 
     The dataset is a top-level JSON array; the M split is ~2.6 GB, so json.load
@@ -122,15 +124,30 @@ def iter_longmemeval_dataset(file_path: str, limit: int | None = None):
     in RAM before anything is processed. ijson parses one array element at a
     time, so peak memory stays ~one question's haystack instead of all 500.
 
-    If ``limit`` is set, yield only the first ``limit`` questions. Use the same
-    ``limit`` for ingest and search so search only queries ingested questions.
+    Subsetting (use the SAME option for ingest and search so they align):
+    - ``limit``: yield only the first N questions. NOTE: the dataset is grouped
+      by question_type, so the first N are all one (easy) type — use only for
+      smoke tests, not a representative benchmark.
+    - ``sample``: yield N evenly-spaced questions across the whole file, so the
+      subset spans all question types proportionally. Deterministic.
     """
     import ijson
+
+    keep: set[int] | None = None
+    if sample is not None:
+        # Fast count pass (question_type only, skips haystacks) to size the
+        # evenly-spaced index set.
+        with open(file_path, "rb") as f:
+            total = sum(1 for _ in ijson.items(f, "item.question_type"))
+        n = min(sample, total)
+        keep = {i * total // n for i in range(n)} if n else set()
 
     with open(file_path, "rb") as f:
         for i, item in enumerate(ijson.items(f, "item")):
             if limit is not None and i >= limit:
                 break
+            if keep is not None and i not in keep:
+                continue
             yield LongMemEvalItem(**item)
 
 
