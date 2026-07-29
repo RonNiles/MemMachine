@@ -11,6 +11,8 @@ from longmemeval_models import (
     get_datetime_from_timestamp,
     iter_longmemeval_dataset,
 )
+from memmachine_server.common.cache.llm_cache_store import LLMCacheStore
+from memmachine_server.common.embedder.caching_embedder import CachingEmbedder
 from memmachine_server.common.embedder.openai_embedder import (
     OpenAIEmbedder,
     OpenAIEmbedderParams,
@@ -77,6 +79,12 @@ async def main():
         help="Query N evenly-spaced questions spanning all question types. Must "
         "match the --sample used at ingest time.",
     )
+    parser.add_argument(
+        "--embedding-cache",
+        default=None,
+        help="Path to an LLM cache SQLite file (e.g. ./llm_cache.db) to cache the "
+        "per-question query embeddings across runs. Omit to disable.",
+    )
     args = parser.parse_args()
 
     data_path = args.data_path
@@ -108,6 +116,22 @@ async def main():
             dimensions=1536,
         )
     )
+
+    # Optionally cache query embeddings so re-runs (and the vector→FTS pair)
+    # reuse them instead of re-calling the provider. Query embeddings are keyed
+    # under a distinct "search" mode, so they never collide with ingest's
+    # cached derivative embeddings even in the same cache file.
+    cache_store: LLMCacheStore | None = None
+    if args.embedding_cache:
+        cache_store = LLMCacheStore(args.embedding_cache)
+        await cache_store.startup()
+        signature = LLMCacheStore.model_signature(
+            provider="openai",
+            model="text-embedding-3-small",
+            dimensions=1536,
+        )
+        embedder = CachingEmbedder(embedder, signature, cache_store)
+        print(f"Embedding cache enabled: {args.embedding_cache}", flush=True)
 
     # "No reranker": IdentityReranker preserves retrieval order without reordering.
     reranker = IdentityReranker()
@@ -238,6 +262,9 @@ async def main():
 
     with open(target_path, "w") as f:
         json.dump(results, f, indent=4)
+
+    if cache_store is not None:
+        await cache_store.close()
 
 
 if __name__ == "__main__":
