@@ -4,30 +4,27 @@ import json
 import os
 import time
 
-import boto3
 import neo4j
 from dotenv import load_dotenv
 from longmemeval_models import (
     LongMemEvalItem,
     get_datetime_from_timestamp,
-    load_longmemeval_dataset,
+    iter_longmemeval_dataset,
 )
 from memmachine_server.common.embedder.openai_embedder import (
     OpenAIEmbedder,
     OpenAIEmbedderParams,
 )
-from memmachine_server.common.reranker.amazon_bedrock_reranker import (
-    AmazonBedrockReranker,
-    AmazonBedrockRerankerParams,
-)
+from memmachine_server.common.episode_store.episode_model import episodes_to_string
+from memmachine_server.common.reranker.identity_reranker import IdentityReranker
 from memmachine_server.common.utils import async_with
 from memmachine_server.common.vector_graph_store.neo4j_vector_graph_store import (
     Neo4jVectorGraphStore,
     Neo4jVectorGraphStoreParams,
 )
-from memmachine_server.episodic_memory.declarative_memory import (
-    DeclarativeMemory,
-    DeclarativeMemoryParams,
+from memmachine_server.episodic_memory.long_term_memory.long_term_memory import (
+    DeclarativeBackendParams,
+    LongTermMemory,
 )
 from openai import AsyncOpenAI
 
@@ -61,13 +58,23 @@ async def main():
     parser.add_argument(
         "--target-path", required=True, help="Path to the target data file"
     )
+    parser.add_argument(
+        "--use-fts",
+        action="store_true",
+        help="Enable hybrid Vector + FTS (RRF) retrieval instead of vector-only",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Query only the first N questions. Must match the --limit used at "
+        "ingest time (search only works for ingested questions).",
+    )
 
     args = parser.parse_args()
 
     data_path = args.data_path
     target_path = args.target_path
-
-    all_questions = load_longmemeval_dataset(data_path)
 
     neo4j_driver = neo4j.AsyncGraphDatabase.driver(
         uri=os.getenv("NEO4J_URI"),
@@ -96,21 +103,8 @@ async def main():
         )
     )
 
-    region = "us-west-2"
-    aws_client = boto3.client(
-        "bedrock-agent-runtime",
-        region_name=region,
-        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-    )
-
-    reranker = AmazonBedrockReranker(
-        AmazonBedrockRerankerParams(
-            client=aws_client,
-            region=region,
-            model_id="cohere.rerank-v3-5:0",
-        )
-    )
+    # "No reranker": IdentityReranker preserves retrieval order without reordering.
+    reranker = IdentityReranker()
 
     async def qa_eval(
         memories,
@@ -149,12 +143,13 @@ async def main():
     ):
         group_id = question.question_id
 
-        memory = DeclarativeMemory(
-            DeclarativeMemoryParams(
+        long_term_memory = LongTermMemory(
+            DeclarativeBackendParams(
                 session_id=group_id,
                 vector_graph_store=vector_graph_store,
                 embedder=embedder,
                 reranker=reranker,
+                message_sentence_chunking=True,
             )
         )
 
@@ -162,13 +157,17 @@ async def main():
 
         total_start = time.monotonic()
         memory_start = time.monotonic()
-        chunks = await memory.search(
-            query=search_query, max_num_episodes=100, expand_context=0
+        # use_fts=False -> vector-only; use_fts=True -> Vector + FTS fused via RRF.
+        scored = await long_term_memory.search_scored(
+            query=search_query,
+            num_episodes_limit=100,
+            expand_context=0,
+            use_fts=args.use_fts,
         )
         memory_end = time.monotonic()
         memory_latency = memory_end - memory_start
 
-        formatted_context = memory.string_from_episode_context(chunks)
+        formatted_context = episodes_to_string([episode for _, episode in scored])
 
         response = await qa_eval(
             formatted_context,
@@ -208,14 +207,26 @@ async def main():
         }
 
     semaphore = asyncio.Semaphore(5)
-    tasks = [
-        async_with(
-            semaphore,
-            process_question(question),
+
+    # Stream questions so the multi-GB dataset is never fully resident. Keep a
+    # bounded window of in-flight searches; collect results as they finish.
+    # Order-independent: each result carries its own question_id/answer, and
+    # evaluation scores results item-by-item.
+    max_outstanding = 10
+    results = []
+    in_flight: set = set()
+    for question in iter_longmemeval_dataset(data_path, limit=args.limit):
+        in_flight.add(
+            asyncio.create_task(async_with(semaphore, process_question(question)))
         )
-        for question in all_questions
-    ]
-    results = await asyncio.gather(*tasks)
+        if len(in_flight) >= max_outstanding:
+            done, in_flight = await asyncio.wait(
+                in_flight, return_when=asyncio.FIRST_COMPLETED
+            )
+            results.extend(task.result() for task in done)
+    if in_flight:
+        done, _ = await asyncio.wait(in_flight)
+        results.extend(task.result() for task in done)
 
     with open(target_path, "w") as f:
         json.dump(results, f, indent=4)

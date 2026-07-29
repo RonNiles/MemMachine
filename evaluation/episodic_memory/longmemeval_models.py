@@ -114,6 +114,26 @@ def load_longmemeval_dataset(file_path: str) -> list[LongMemEvalItem]:
     return [LongMemEvalItem(**item) for item in raw_data]
 
 
+def iter_longmemeval_dataset(file_path: str, limit: int | None = None):
+    """Yield LongMemEvalItem objects one at a time, streaming (constant memory).
+
+    The dataset is a top-level JSON array; the M split is ~2.6 GB, so json.load
+    would materialize the whole file (plus Pydantic objects for all questions)
+    in RAM before anything is processed. ijson parses one array element at a
+    time, so peak memory stays ~one question's haystack instead of all 500.
+
+    If ``limit`` is set, yield only the first ``limit`` questions. Use the same
+    ``limit`` for ingest and search so search only queries ingested questions.
+    """
+    import ijson
+
+    with open(file_path, "rb") as f:
+        for i, item in enumerate(ijson.items(f, "item")):
+            if limit is not None and i >= limit:
+                break
+            yield LongMemEvalItem(**item)
+
+
 def get_datetime_from_timestamp(ts: str) -> datetime:
     """
     Convert timestamp string in the format "2023/04/10 (Mon) 23:07" to a datetime object

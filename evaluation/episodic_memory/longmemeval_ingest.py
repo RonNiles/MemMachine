@@ -4,22 +4,18 @@ import os
 from datetime import datetime
 from uuid import uuid4
 
-import boto3
 import neo4j
 import openai
 from dotenv import load_dotenv
 from longmemeval_models import (
     LongMemEvalItem,
-    load_longmemeval_dataset,
+    iter_longmemeval_dataset,
 )
 from memmachine_server.common.embedder.openai_embedder import (
     OpenAIEmbedder,
     OpenAIEmbedderParams,
 )
-from memmachine_server.common.reranker.amazon_bedrock_reranker import (
-    AmazonBedrockReranker,
-    AmazonBedrockRerankerParams,
-)
+from memmachine_server.common.reranker.identity_reranker import IdentityReranker
 from memmachine_server.common.utils import async_with
 from memmachine_server.common.vector_graph_store.neo4j_vector_graph_store import (
     Neo4jVectorGraphStore,
@@ -37,14 +33,29 @@ async def main():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--data-path", required=True, help="Path to the data file")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Ingest only the first N questions (subset for faster A/B runs). "
+        "Use the same --limit for the search step.",
+    )
+    parser.add_argument(
+        "--session-concurrency",
+        type=int,
+        default=4,
+        help="Max sessions embedded/written concurrently per question "
+        "(lower = less peak memory)",
+    )
+    parser.add_argument(
+        "--no-sentence-chunking",
+        action="store_true",
+        help="Disable per-sentence chunking (~5x less memory/disk, ~1-2%% lower scores)",
+    )
 
     args = parser.parse_args()
 
     data_path = args.data_path
-
-    all_questions = load_longmemeval_dataset(data_path)
-    num_questions = len(all_questions)
-    print(f"{num_questions} total questions")
 
     neo4j_driver = neo4j.AsyncGraphDatabase.driver(
         uri=os.getenv("NEO4J_URI"),
@@ -75,21 +86,9 @@ async def main():
         )
     )
 
-    region = "us-west-2"
-    aws_client = boto3.client(
-        "bedrock-agent-runtime",
-        region_name=region,
-        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-    )
-
-    reranker = AmazonBedrockReranker(
-        AmazonBedrockRerankerParams(
-            client=aws_client,
-            region=region,
-            model_id="cohere.rerank-v3-5:0",
-        )
-    )
+    # "No reranker": IdentityReranker preserves order (declarative memory still
+    # requires a reranker object; this one does no reordering).
+    reranker = IdentityReranker()
 
     async def process_conversation(question: LongMemEvalItem):
         group_id = question.question_id
@@ -101,7 +100,7 @@ async def main():
                 vector_graph_store=vector_graph_store,
                 embedder=embedder,
                 reranker=reranker,
-                message_sentence_chunking=True,
+                message_sentence_chunking=not args.no_sentence_chunking,
             )
         )
 
@@ -127,16 +126,26 @@ async def main():
                     )
                 )
 
-            session_tasks.append(memory.add_episodes(episodes=episodes))
+            # Bound concurrency so only N sessions' chunks+embeddings are in
+            # flight at once, instead of the whole haystack simultaneously.
+            session_tasks.append(
+                async_with(session_semaphore, memory.add_episodes(episodes=episodes))
+            )
 
         await asyncio.gather(*session_tasks)
 
-    semaphore = asyncio.Semaphore(1)
-    tasks = [
-        async_with(semaphore, process_conversation(question))
-        for question in all_questions
-    ]
-    await asyncio.gather(*tasks)
+    session_semaphore = asyncio.Semaphore(args.session_concurrency)
+
+    # Stream one question at a time so the multi-GB dataset is never fully
+    # resident (json.load on the ~2.6 GB M split alone exhausts RAM). Questions
+    # are ingested sequentially; the session semaphore bounds concurrency
+    # within each question.
+    count = 0
+    for question in iter_longmemeval_dataset(data_path, limit=args.limit):
+        await process_conversation(question)
+        count += 1
+        print(f"ingested {count} questions (last: {question.question_id})", flush=True)
+    print(f"Done: {count} questions ingested")
 
 
 if __name__ == "__main__":
