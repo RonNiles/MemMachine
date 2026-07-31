@@ -12,7 +12,9 @@ from tqdm.asyncio import tqdm_asyncio
 
 load_dotenv()
 
-client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# Retry on transient rate limits (429): the concurrent judge calls can burst
+# past the model's TPM limit; the SDK honors the 429 Retry-After on backoff.
+client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"), max_retries=10)
 
 
 async def get_llm_evaluation(prompt, model="gpt-4o"):

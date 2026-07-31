@@ -107,6 +107,11 @@ async def main():
 
     openai_client = AsyncOpenAI(
         api_key=os.getenv("OPENAI_API_KEY"),
+        # Answer generation over 100-episode prompts is token-heavy and can
+        # burst past the model's TPM limit; let the SDK back off and retry
+        # (it honors the 429 Retry-After) instead of crashing the whole run,
+        # which would discard all results (they are only written at the end).
+        max_retries=10,
     )
 
     embedder = OpenAIEmbedder(
