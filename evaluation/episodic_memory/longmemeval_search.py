@@ -139,9 +139,12 @@ async def main():
     # answer-generation model (e.g. a hosted Qwen embedder), so give it its own
     # client and key (EMBEDDING_API_KEY, falling back to OPENAI_API_KEY). It
     # must match the embedder used at ingest so queries land in the same space.
+    # High max_retries rides out transient provider overload (e.g. DeepInfra
+    # 429 "engine_overloaded") with backoff, as the embedder uses max_attempts=1.
     embedding_client = AsyncOpenAI(
         api_key=os.getenv("EMBEDDING_API_KEY") or os.getenv("OPENAI_API_KEY"),
         base_url=args.embedding_base_url,
+        max_retries=8,
     )
 
     embedder = OpenAIEmbedder(

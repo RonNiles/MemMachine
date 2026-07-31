@@ -118,10 +118,14 @@ async def main():  # noqa: C901 - linear setup + ingest loop; complexity is inhe
 
     # The embedder may point at a different OpenAI-compatible provider than
     # OpenAI (e.g. a hosted Qwen embedder), with its own key (EMBEDDING_API_KEY,
-    # falling back to OPENAI_API_KEY). base_url=None uses OpenAI.
+    # falling back to OPENAI_API_KEY). base_url=None uses OpenAI. A high
+    # max_retries lets the SDK ride out transient provider overload (e.g.
+    # DeepInfra 429 "engine_overloaded" while it autoscales) with exponential
+    # backoff, since the embedder itself is invoked with max_attempts=1.
     embedding_client = openai.AsyncOpenAI(
         api_key=os.getenv("EMBEDDING_API_KEY") or os.getenv("OPENAI_API_KEY"),
         base_url=args.embedding_base_url,
+        max_retries=8,
     )
 
     embedder = OpenAIEmbedder(
