@@ -7,6 +7,8 @@ from time import time
 
 import numpy as np
 from dotenv import load_dotenv
+from llm_cache_util import cached_chat_completion
+from memmachine_server.common.cache.llm_cache_store import LLMCacheStore
 from openai import AsyncOpenAI
 from tqdm.asyncio import tqdm_asyncio
 
@@ -16,19 +18,26 @@ load_dotenv()
 # past the model's TPM limit; the SDK honors the 429 Retry-After on backoff.
 client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"), max_retries=10)
 
+# Optional shared LLM cache (set from --llm-cache in main). The deterministic
+# judge (temperature=0) caches cleanly, so re-scoring replays for free.
+_CACHE_STORE: LLMCacheStore | None = None
+
 
 async def get_llm_evaluation(prompt, model="gpt-4o"):
     """
     Get LLM evaluation for a given prompt
     """
     try:
-        # Replace with your preferred LLM API call
-        response = await client.chat.completions.create(
+        # Served from the shared LLM cache (same .db as the search harness)
+        # when --llm-cache is set, so re-scoring replays instead of re-billing.
+        result = await cached_chat_completion(
+            _CACHE_STORE,
+            client,
             model=model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
         )
-        return response.choices[0].message.content.strip().lower()
+        return result["content"].lower()
     except Exception as e:
         print(f"Error in LLM evaluation: {e}")
         return "error"
@@ -188,11 +197,23 @@ async def main():
     parser.add_argument(
         "--target-path", required=True, help="Path to the target data file"
     )
+    parser.add_argument(
+        "--llm-cache",
+        default=None,
+        help="Path to an LLM cache SQLite file (e.g. ./llm_cache.db) to cache "
+        "judge responses across runs. Omit to disable.",
+    )
 
     args = parser.parse_args()
 
     data_path = args.data_path
     target_path = args.target_path
+
+    global _CACHE_STORE
+    if args.llm_cache:
+        _CACHE_STORE = LLMCacheStore(args.llm_cache)
+        await _CACHE_STORE.startup()
+        print(f"LLM cache enabled: {args.llm_cache}", flush=True)
 
     # Load your dataset
     responses = load_dataset(data_path)
@@ -205,6 +226,9 @@ async def main():
     )
     # Save results
     save_results(results, output_path=target_path)
+
+    if _CACHE_STORE is not None:
+        await _CACHE_STORE.close()
 
 
 if __name__ == "__main__":

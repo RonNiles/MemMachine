@@ -6,6 +6,7 @@ import time
 
 import neo4j
 from dotenv import load_dotenv
+from llm_cache_util import cached_chat_completion
 from longmemeval_models import (
     LongMemEvalItem,
     get_datetime_from_timestamp,
@@ -147,30 +148,27 @@ async def main():
         question: str,
         model: str = "gpt-5-mini",
     ):
-        start_time = time.monotonic()
-        response = await openai_client.chat.completions.create(
-            model=model,
-            messages=[
-                {
-                    "role": "user",
-                    "content": ANSWER_PROMPT.format(
-                        memories=memories,
-                        question_timestamp=question_timestamp,
-                        question=question,
-                    ),
-                },
-            ],
+        messages = [
+            {
+                "role": "user",
+                "content": ANSWER_PROMPT.format(
+                    memories=memories,
+                    question_timestamp=question_timestamp,
+                    question=question,
+                ),
+            },
+        ]
+        # Served from the shared cache (same --embedding-cache .db) when set, so
+        # a re-run or crash-resume reuses answers instead of re-billing.
+        result = await cached_chat_completion(
+            cache_store, openai_client, model=model, messages=messages
         )
-        end_time = time.monotonic()
-
-        latency = end_time - start_time
-
         return {
-            "response": response.choices[0].message.content.strip(),
-            "input_tokens": response.usage.prompt_tokens,
-            "output_tokens": response.usage.completion_tokens,
-            "total_tokens": response.usage.total_tokens,
-            "latency": latency,
+            "response": result["content"],
+            "input_tokens": result["input_tokens"],
+            "output_tokens": result["output_tokens"],
+            "total_tokens": result["input_tokens"] + result["output_tokens"],
+            "latency": result["latency"],
         }
 
     async def process_question(
