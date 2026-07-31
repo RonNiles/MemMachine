@@ -76,6 +76,26 @@ async def main():  # noqa: C901 - linear setup + ingest loop; complexity is inhe
         help="Retry each question up to N times on transient failures (e.g. an "
         "embedding 404) before skipping it, so one blip can't abort a long run.",
     )
+    parser.add_argument(
+        "--embedding-model",
+        default="text-embedding-3-small",
+        help="Embedding model id (e.g. Qwen/Qwen3-Embedding-4B). Must match "
+        "between ingest and search.",
+    )
+    parser.add_argument(
+        "--embedding-dimensions",
+        type=int,
+        default=1536,
+        help="Embedding dimensionality (e.g. 2560 for Qwen3-Embedding-4B). Must "
+        "match between ingest and search.",
+    )
+    parser.add_argument(
+        "--embedding-base-url",
+        default=None,
+        help="OpenAI-compatible base URL for the embedding provider (e.g. "
+        "https://api.deepinfra.com/v1/openai). Omit to use OpenAI. The API key "
+        "comes from EMBEDDING_API_KEY, falling back to OPENAI_API_KEY.",
+    )
     args = parser.parse_args()
 
     data_path = args.data_path
@@ -96,15 +116,19 @@ async def main():  # noqa: C901 - linear setup + ingest loop; complexity is inhe
         )
     )
 
-    openai_client = openai.AsyncOpenAI(
-        api_key=os.getenv("OPENAI_API_KEY"),
+    # The embedder may point at a different OpenAI-compatible provider than
+    # OpenAI (e.g. a hosted Qwen embedder), with its own key (EMBEDDING_API_KEY,
+    # falling back to OPENAI_API_KEY). base_url=None uses OpenAI.
+    embedding_client = openai.AsyncOpenAI(
+        api_key=os.getenv("EMBEDDING_API_KEY") or os.getenv("OPENAI_API_KEY"),
+        base_url=args.embedding_base_url,
     )
 
     embedder = OpenAIEmbedder(
         OpenAIEmbedderParams(
-            client=openai_client,
-            model="text-embedding-3-small",
-            dimensions=1536,
+            client=embedding_client,
+            model=args.embedding_model,
+            dimensions=args.embedding_dimensions,
             max_input_length=2048,
         )
     )
@@ -120,8 +144,8 @@ async def main():  # noqa: C901 - linear setup + ingest loop; complexity is inhe
         await cache_store.startup()
         signature = LLMCacheStore.model_signature(
             provider="openai",
-            model="text-embedding-3-small",
-            dimensions=1536,
+            model=args.embedding_model,
+            dimensions=args.embedding_dimensions,
             max_input_length=2048,
         )
         embedder = CachingEmbedder(embedder, signature, cache_store)

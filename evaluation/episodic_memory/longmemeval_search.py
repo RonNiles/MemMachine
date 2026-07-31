@@ -86,6 +86,26 @@ async def main():
         help="Path to an LLM cache SQLite file (e.g. ./llm_cache.db) to cache the "
         "per-question query embeddings across runs. Omit to disable.",
     )
+    parser.add_argument(
+        "--embedding-model",
+        default="text-embedding-3-small",
+        help="Embedding model id (e.g. Qwen/Qwen3-Embedding-4B). Must match the "
+        "value used at ingest time.",
+    )
+    parser.add_argument(
+        "--embedding-dimensions",
+        type=int,
+        default=1536,
+        help="Embedding dimensionality (e.g. 2560 for Qwen3-Embedding-4B). Must "
+        "match the value used at ingest time.",
+    )
+    parser.add_argument(
+        "--embedding-base-url",
+        default=None,
+        help="OpenAI-compatible base URL for the embedding provider (e.g. "
+        "https://api.deepinfra.com/v1/openai). Omit to use OpenAI. The API key "
+        "comes from EMBEDDING_API_KEY, falling back to OPENAI_API_KEY.",
+    )
     args = parser.parse_args()
 
     data_path = args.data_path
@@ -115,11 +135,20 @@ async def main():
         max_retries=10,
     )
 
+    # Embeddings may come from a different OpenAI-compatible provider than the
+    # answer-generation model (e.g. a hosted Qwen embedder), so give it its own
+    # client and key (EMBEDDING_API_KEY, falling back to OPENAI_API_KEY). It
+    # must match the embedder used at ingest so queries land in the same space.
+    embedding_client = AsyncOpenAI(
+        api_key=os.getenv("EMBEDDING_API_KEY") or os.getenv("OPENAI_API_KEY"),
+        base_url=args.embedding_base_url,
+    )
+
     embedder = OpenAIEmbedder(
         OpenAIEmbedderParams(
-            client=openai_client,
-            model="text-embedding-3-small",
-            dimensions=1536,
+            client=embedding_client,
+            model=args.embedding_model,
+            dimensions=args.embedding_dimensions,
         )
     )
 
@@ -133,8 +162,8 @@ async def main():
         await cache_store.startup()
         signature = LLMCacheStore.model_signature(
             provider="openai",
-            model="text-embedding-3-small",
-            dimensions=1536,
+            model=args.embedding_model,
+            dimensions=args.embedding_dimensions,
         )
         embedder = CachingEmbedder(embedder, signature, cache_store)
         print(f"Embedding cache enabled: {args.embedding_cache}", flush=True)
