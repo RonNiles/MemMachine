@@ -261,6 +261,7 @@ class LongTermMemory:
         score_threshold: float | None = None,
         property_filter: FilterExpr | None = None,
         use_fts: bool = False,  # Full-Text Search flag for hybrid search
+        fusion: str = "rrf",  # hybrid fusion strategy: "rrf" or "append"
     ) -> list[tuple[float, Episode]]:
         """Score-thresholded query.
 
@@ -281,6 +282,7 @@ class LongTermMemory:
                     expand_context=expand_context,
                     score_threshold=score_threshold,
                     property_filter=property_filter,
+                    fusion=fusion,
                 )
             return await self._search_scored_declarative(
                 query,
@@ -305,6 +307,7 @@ class LongTermMemory:
         expand_context: int,
         score_threshold: float | None,
         property_filter: FilterExpr | None,
+        fusion: str = "rrf",
     ) -> list[tuple[float, Episode]]:
         """Hybrid search: Reciprocal Rank Fusion (RRF) of the vector + FTS legs.
 
@@ -319,8 +322,21 @@ class LongTermMemory:
         (higher-is-better), not a vector or Lucene score.
 
         Returns up to num_episodes_limit results ordered by fused score.
+
+        With ``fusion="append"`` the original pre-RRF method is used instead:
+        the FTS top-10 is appended after the vector list (dedup by uid), so FTS
+        augments rather than competes for slots. Kept for A/B comparison.
         """
         assert self._declarative_memory is not None
+
+        if fusion == "append":
+            return await self._search_scored_hybrid_append(
+                query,
+                num_episodes_limit=num_episodes_limit,
+                expand_context=expand_context,
+                score_threshold=score_threshold,
+                property_filter=property_filter,
+            )
 
         # Run both legs concurrently, each returning an independently ranked
         # list. score_threshold is applied post-fusion, so both legs run
@@ -348,6 +364,51 @@ class LongTermMemory:
                 (score, episode) for score, episode in fused if score >= score_threshold
             ]
         return fused[:num_episodes_limit]
+
+    async def _search_scored_hybrid_append(
+        self,
+        query: str,
+        *,
+        num_episodes_limit: int,
+        expand_context: int,
+        score_threshold: float | None,
+        property_filter: FilterExpr | None,
+    ) -> list[tuple[float, Episode]]:
+        """Original pre-RRF hybrid: vector list + appended FTS top-10 (dedup).
+
+        The vector leg fills ``num_episodes_limit``; the FTS top-10 is appended
+        after it, skipping episode uids already present. FTS therefore augments
+        the vector results (up to ``num_episodes_limit + 10`` total) rather than
+        competing for slots, so it never displaces a vector hit. Retained to A/B
+        against the RRF fusion path.
+        """
+        assert self._declarative_memory is not None
+
+        vector_results, fts_results_full = await asyncio.gather(
+            self._search_scored_declarative(
+                query,
+                num_episodes_limit=num_episodes_limit,
+                expand_context=expand_context,
+                score_threshold=None,
+                property_filter=property_filter,
+            ),
+            self._search_fts(query, num_episodes_limit=10),
+        )
+
+        merged_results = list(vector_results)
+        seen_uids = {episode.uid for _, episode in merged_results}
+        for score, episode in fts_results_full[:10]:
+            if episode.uid not in seen_uids:
+                merged_results.append((score, episode))
+                seen_uids.add(episode.uid)
+
+        if score_threshold is not None:
+            merged_results = [
+                (score, episode)
+                for score, episode in merged_results
+                if score >= score_threshold
+            ]
+        return merged_results
 
     @staticmethod
     def _rrf_fuse(

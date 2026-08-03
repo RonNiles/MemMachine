@@ -64,7 +64,15 @@ async def main():
     parser.add_argument(
         "--use-fts",
         action="store_true",
-        help="Enable hybrid Vector + FTS (RRF) retrieval instead of vector-only",
+        help="Enable hybrid Vector + FTS retrieval instead of vector-only",
+    )
+    parser.add_argument(
+        "--fusion",
+        choices=["rrf", "append"],
+        default="rrf",
+        help="Hybrid fusion strategy when --use-fts is set: 'rrf' (Reciprocal "
+        "Rank Fusion) or 'append' (original PR method: append FTS top-10 to the "
+        "vector list). Ignored without --use-fts.",
     )
     parser.add_argument(
         "--limit",
@@ -228,6 +236,7 @@ async def main():
             num_episodes_limit=100,
             expand_context=0,
             use_fts=args.use_fts,
+            fusion=args.fusion,
         )
         memory_end = time.monotonic()
         memory_latency = memory_end - memory_start
