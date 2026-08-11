@@ -96,6 +96,15 @@ async def main():  # noqa: C901 - linear setup + ingest loop; complexity is inhe
         "https://api.deepinfra.com/v1/openai). Omit to use OpenAI. The API key "
         "comes from EMBEDDING_API_KEY, falling back to OPENAI_API_KEY.",
     )
+    parser.add_argument(
+        "--no-vector-index",
+        action="store_true",
+        help="Skip per-collection vector (HNSW) index creation. Search then uses "
+        "exact brute-force similarity over each (bounded) per-question collection "
+        "— the same path collections below the threshold already use. Avoids the "
+        "on-heap growth from hundreds of vector indexes under sentence chunking "
+        "(which GC-thrashed Neo4j at scale); recommended for chunked full runs.",
+    )
     args = parser.parse_args()
 
     data_path = args.data_path
@@ -108,11 +117,18 @@ async def main():  # noqa: C901 - linear setup + ingest loop; complexity is inhe
         ),
     )
 
+    # This harness ingests one collection per question; with sentence chunking
+    # those collections cross the 10k threshold and each builds a 1536-dim HNSW
+    # vector index whose on-heap state accumulates with question count and
+    # GC-thrashes Neo4j (2G heap died at q59, 8G at q248). --no-vector-index
+    # sets the threshold out of reach so none are built; search_similar_nodes
+    # then falls back to exact brute-force cosine over each bounded collection.
+    vector_index_threshold = 1_000_000_000 if args.no_vector_index else 10000
     vector_graph_store = Neo4jVectorGraphStore(
         Neo4jVectorGraphStoreParams(
             driver=neo4j_driver,
             range_index_creation_threshold=10000,
-            vector_index_creation_threshold=10000,
+            vector_index_creation_threshold=vector_index_threshold,
         )
     )
 
