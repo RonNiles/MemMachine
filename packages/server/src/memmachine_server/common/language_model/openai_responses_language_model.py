@@ -62,6 +62,23 @@ class OpenAIResponsesLanguageModelParams(BaseModel):
         description="Maximal retry interval in seconds when retrying API calls",
         gt=0,
     )
+    max_output_tokens: int | None = Field(
+        None,
+        description=(
+            "Maximum number of output tokens per request. Caps generation so a "
+            "runaway response cannot grow toward the model's full output ceiling. "
+            "If None, the provider default is used."
+        ),
+        gt=0,
+    )
+    request_timeout_seconds: float | None = Field(
+        None,
+        description=(
+            "Per-request timeout in seconds, applied via the client's "
+            "with_options(timeout=...). If None, the client default is used."
+        ),
+        gt=0,
+    )
     metrics_factory: InstanceOf[MetricsFactory] | None = Field(
         None,
         description="An instance of MetricsFactory for collecting usage metrics",
@@ -103,12 +120,17 @@ class OpenAIResponsesLanguageModel(LanguageModel):
 
         self._max_retry_interval_seconds = params.max_retry_interval_seconds
         self._reasoning_effort = params.reasoning_effort
+        self._request_timeout_seconds = params.request_timeout_seconds
 
-        # Optional sampling params spread into every API call; omitted entirely
-        # when None so the provider default is used.
+        # Optional request params spread into every API call; omitted entirely
+        # when None so the provider default is used. max_output_tokens caps the
+        # generation length so a degenerate runaway response cannot stall the
+        # caller for minutes.
         self._sampling_kwargs: dict[str, Any] = {}
         if params.temperature is not None:
             self._sampling_kwargs["temperature"] = params.temperature
+        if params.max_output_tokens is not None:
+            self._sampling_kwargs["max_output_tokens"] = params.max_output_tokens
 
         metrics_factory = params.metrics_factory
 
@@ -144,6 +166,23 @@ class OpenAIResponsesLanguageModel(LanguageModel):
                 "Number of tokens used for OpenAI language model",
             )
 
+    def _client_with_options(
+        self, *, max_retries: int | None = None
+    ) -> openai.AsyncOpenAI:
+        """Return the client with a per-request timeout (and optional retries).
+
+        Applying the timeout via ``with_options`` bounds a single API call so a
+        pathological generation is aborted rather than blocking for the OpenAI
+        client default (600s). When no timeout is configured, the client is
+        returned with only the requested retry override (if any).
+        """
+        options: dict[str, Any] = {}
+        if self._request_timeout_seconds is not None:
+            options["timeout"] = self._request_timeout_seconds
+        if max_retries is not None:
+            options["max_retries"] = max_retries
+        return self._client.with_options(**options) if options else self._client
+
     async def generate_parsed_response(
         self,
         output_format: type[T],
@@ -152,6 +191,22 @@ class OpenAIResponsesLanguageModel(LanguageModel):
         max_attempts: int = 1,
     ) -> T | None:
         """Generate a structured response parsed into the given model."""
+        result, _, _ = await self.generate_parsed_response_with_token_usage(
+            output_format=output_format,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            max_attempts=max_attempts,
+        )
+        return result
+
+    async def generate_parsed_response_with_token_usage(
+        self,
+        output_format: type[T],
+        system_prompt: str | None = None,
+        user_prompt: str | None = None,
+        max_attempts: int = 1,
+    ) -> tuple[T | None, int, int]:
+        """Structured parse that also reports input/output token usage."""
         async with self._tracker("generate_parsed_response"):
             if max_attempts <= 0:
                 raise ValueError("max_attempts must be a positive integer")
@@ -167,7 +222,7 @@ class OpenAIResponsesLanguageModel(LanguageModel):
             generate_response_call_uuid = uuid4()
 
             try:
-                response = await self._client.with_options(
+                response = await self._client_with_options(
                     max_retries=max_attempts,
                 ).responses.parse(
                     model=self._model,
@@ -186,8 +241,13 @@ class OpenAIResponsesLanguageModel(LanguageModel):
                 raise ExternalServiceAPIError(error_message) from e
 
             self._collect_usage_metrics(response)
+            self._warn_if_truncated(response, generate_response_call_uuid)
 
-            return response.output_parsed
+            return (
+                response.output_parsed,
+                response.usage.input_tokens if response.usage else 0,
+                response.usage.output_tokens if response.usage else 0,
+            )
 
     async def generate_response(
         self,
@@ -260,14 +320,14 @@ class OpenAIResponsesLanguageModel(LanguageModel):
                         max_attempts,
                     )
                     if tools is None:
-                        response = await self._client.responses.create(
+                        response = await self._client_with_options().responses.create(
                             model=self._model,
                             input=input_prompts,
                             store=False,
                             **self._sampling_kwargs,
                         )
                     else:
-                        response = await self._client.responses.create(
+                        response = await self._client_with_options().responses.create(
                             model=self._model,
                             input=input_prompts,
                             store=False,
@@ -324,6 +384,7 @@ class OpenAIResponsesLanguageModel(LanguageModel):
                 raise RuntimeError("OpenAI response was not generated")
 
             self._collect_usage_metrics(response)
+            self._warn_if_truncated(response, generate_response_call_uuid)
 
             if response.output is None:
                 return (response.output_text or "", [], 0, 0)
@@ -354,6 +415,30 @@ class OpenAIResponsesLanguageModel(LanguageModel):
                 response.usage.input_tokens if response.usage else 0,
                 response.usage.output_tokens if response.usage else 0,
             )
+
+    def _warn_if_truncated(self, response: Response, call_uuid: object) -> None:
+        """Log a warning when a response was cut short rather than completed.
+
+        A generation truncated at ``max_output_tokens`` (or otherwise stopped
+        early) comes back with ``status == "incomplete"`` instead of raising,
+        so without this check a partial response is silently returned — and,
+        once the model is wrapped by the cache, persisted as if it were a
+        complete result.
+        """
+        if response.status != "incomplete":
+            return
+        reason = (
+            response.incomplete_details.reason
+            if response.incomplete_details is not None
+            else None
+        )
+        logger.warning(
+            "[call uuid: %s] %s response is incomplete (reason=%s); "
+            "output was truncated and may be partial.",
+            call_uuid,
+            self._model,
+            reason,
+        )
 
     def _collect_usage_metrics(self, response: Response) -> None:
         if not self._should_collect_metrics:

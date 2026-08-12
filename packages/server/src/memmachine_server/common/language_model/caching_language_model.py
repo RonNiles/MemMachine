@@ -197,7 +197,11 @@ class CachingLanguageModel(LanguageModel):
 
         logger.debug("LLM cache miss (generate_parsed_response, key=%.12s).", key)
         start = perf_counter()
-        result = await self._inner.generate_parsed_response(
+        (
+            result,
+            input_tokens,
+            output_tokens,
+        ) = await self._inner.generate_parsed_response_with_token_usage(
             output_format=output_format,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
@@ -217,8 +221,8 @@ class CachingLanguageModel(LanguageModel):
             method="generate_parsed_response",
             request_json=canonical_json(payload),
             response_json=cast("BaseModel", result).model_dump_json(),
-            input_tokens=0,
-            output_tokens=0,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
             latency_ms=latency_ms,
         )
         return cast("T", result)
