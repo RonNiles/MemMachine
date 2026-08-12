@@ -1,0 +1,51 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "memmachine-server (native)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "memmachine_server.server.app",
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "envFile": "${workspaceFolder}/.env",
+      "env": {
+        "MEMORY_CONFIG": "${workspaceFolder}/configuration.yml",
+        "MEMMACHINE_WORKERS": "1",
+        "PYTHONUNBUFFERED": "1"
+      },
+      "stopOnEntry": true,
+      "justMyCode": false,
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "memmachine-server (with config API)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "memmachine_server.server.app",
+      "args": ["--with-config-api"],
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "envFile": "${workspaceFolder}/.env",
+      "env": {
+        "MEMORY_CONFIG": "${workspaceFolder}/configuration.yml",
+        "MEMMACHINE_WORKERS": "1",
+        "PYTHONUNBUFFERED": "1"
+      },
+      "justMyCode": false,
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "alembic upgrade head",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "alembic",
+      "args": ["upgrade", "head"],
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": false,
+      "console": "integratedTerminal"
+    }
+  ]
+}
