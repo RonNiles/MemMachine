@@ -388,6 +388,38 @@ class InMemorySemanticStorage(SemanticStorage):
         for set_id in results:
             yield set_id
 
+    async def get_oldest_pending_history_at(
+        self,
+        set_id: SetIdT,
+    ) -> datetime | None:
+        async with self._lock:
+            history_map = self._set_history_map.get(set_id)
+            if not history_map:
+                return None
+            pending_timestamps = [
+                self._history_created_at.get((set_id, history_id))
+                for history_id, ingested in history_map.items()
+                if not ingested
+            ]
+            timestamps = [ts for ts in pending_timestamps if ts is not None]
+            if not timestamps:
+                return None
+            return min(timestamps)
+
+    async def get_feature_counts_by_category(
+        self,
+        set_id: SetIdT,
+    ) -> Mapping[str, int]:
+        async with self._lock:
+            feature_ids = self._feature_ids_by_set.get(set_id, [])
+            counts: dict[str, int] = {}
+            for feature_id in feature_ids:
+                entry = self._features_by_id.get(feature_id)
+                if entry is None:
+                    continue
+                counts[entry.semantic_type_id] = counts.get(entry.semantic_type_id, 0) + 1
+            return counts
+
     def _handle_set_change(
         self,
         entry: _FeatureEntry,

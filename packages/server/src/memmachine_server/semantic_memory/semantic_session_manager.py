@@ -196,6 +196,45 @@ class SemanticSessionManager:
             set_ids=list(set_ids),
         )
 
+    def get_ingestion_thresholds(self) -> SemanticService.IngestionThresholds:
+        """Return the ingestion thresholds in effect on the semantic service."""
+        return self._semantic_service.get_ingestion_thresholds()
+
+    async def list_ingestion_statuses(
+        self,
+        *,
+        session_data: SessionData,
+        set_metadata: Mapping[str, JsonValue] | None = None,
+    ) -> AsyncIterator[SemanticService.SetIngestionStatus]:
+        """Yield ingestion status for sets matching the request.
+
+        When ``set_metadata`` is provided the request is scoped to the set_ids
+        resolved by the normal session-manager rules. When omitted, every set
+        under the caller's org/project that has at least one pending message
+        is yielded.
+        """
+        self._assert_session_data_implements_protocol(session_data=session_data)
+
+        if set_metadata is None:
+            async for set_id in self._semantic_service.list_pending_set_ids_starts_with(
+                "mem_"
+            ):
+                if not self._set_id_in_scope(
+                    set_id,
+                    org_id=session_data.org_id,
+                    project_id=session_data.project_id,
+                ):
+                    continue
+                yield await self._semantic_service.get_set_ingestion_status(set_id)
+            return
+
+        set_ids = await self._get_set_ids_str_from_metadata(
+            session_data=session_data,
+            metadata=set_metadata,
+        )
+        for set_id in set_ids:
+            yield await self._semantic_service.get_set_ingestion_status(set_id)
+
     async def add_feature(
         self,
         *,
@@ -425,6 +464,48 @@ class SemanticSessionManager:
             org_project = org_base
 
         return org_project
+
+    @classmethod
+    def _set_id_in_scope(
+        cls,
+        set_id: SetIdT,
+        *,
+        org_id: str,
+        project_id: str | None,
+    ) -> bool:
+        """Return True if set_id belongs to the given (org, project) scope.
+
+        set_ids are produced by ``_generate_set_id`` as
+        ``mem_<type>_org_<org>_[project_<proj>_]<count>_<hash>__<tags>``. Naive
+        ``startswith("org_<org>_project_<proj>")`` never matches because of the
+        leading ``mem_<type>_`` segment, so we structurally walk the known
+        anchors instead. The count is always an integer, which lets us
+        distinguish an org-level set (count immediately follows the org token)
+        from a project-scoped set (project token first, then count).
+        """
+        if not set_id.startswith("mem_"):
+            return False
+        remainder: str | None = None
+        for set_type in cls.SetType:
+            type_prefix = f"mem_{set_type.value}_"
+            if set_id.startswith(type_prefix):
+                remainder = set_id[len(type_prefix) :]
+                break
+        if remainder is None:
+            return False
+        org_marker = f"org_{org_id}_"
+        if not remainder.startswith(org_marker):
+            return False
+        tail = remainder[len(org_marker) :]
+        if tail and tail[0].isdigit():
+            return True
+        if project_id is not None:
+            project_marker = f"project_{project_id}_"
+            if tail.startswith(project_marker):
+                after_project = tail[len(project_marker) :]
+                if after_project and after_project[0].isdigit():
+                    return True
+        return False
 
     @classmethod
     def _generate_set_id(

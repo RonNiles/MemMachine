@@ -234,6 +234,7 @@ class Params(BaseModel):
             set_metadata=None,
             types=ALL_MEMORY_TYPES,
             agent_mode=agent_mode,
+            load_citations=False,
         )
 
     def to_delete_memories_spec(

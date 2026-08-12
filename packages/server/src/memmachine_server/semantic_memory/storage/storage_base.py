@@ -203,3 +203,19 @@ class SemanticStorage(ABC):
     def get_set_ids_starts_with(self, prefix: str) -> AsyncIterator[SetIdT]:
         """Return all set id's that start with the specified prefix."""
         raise NotImplementedError
+
+    @abstractmethod
+    async def get_oldest_pending_history_at(
+        self,
+        set_id: SetIdT,
+    ) -> datetime | None:
+        """Return the oldest un-ingested history timestamp for a set, or None."""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def get_feature_counts_by_category(
+        self,
+        set_id: SetIdT,
+    ) -> Mapping[str, int]:
+        """Return feature counts grouped by category name for a single set."""
+        raise NotImplementedError
