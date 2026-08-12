@@ -127,6 +127,86 @@ docker-compose restart
 docker-compose down -v
 ```
 
+## Backup, Restore & Replication
+
+Three helper scripts under `scripts/` manage the databases (PostgreSQL + Neo4j,
+plus the optional `llm_cache.db`):
+
+- `db-backup.sh` — full backup / restore (binary dumps; fast, reliable).
+- `db-sync-export.sh` / `db-sync-apply.sh` — incremental replication to keep a
+  remote read-only mirror up to date without full restores.
+
+**Compose container names.** The scripts default to the `dev-db.sh` names
+(`memmachine-*-dev`). Under Docker Compose the containers are `memmachine-postgres`
+and `memmachine-neo4j`, so export those overrides first:
+
+```bash
+export PG_CONTAINER=memmachine-postgres NEO_CONTAINER=memmachine-neo4j
+# To include the LLM cache, enable the ./cache volume in docker-compose.yml
+# (see the memmachine service) and set llm_cache.path: /app/cache/llm_cache.db,
+# then also: export LLM_CACHE=./cache/llm_cache.db
+```
+
+### Full backup / restore
+
+Stop the app first so the dumps are consistent (the DB containers stay up):
+
+```bash
+# Backup
+docker compose stop memmachine
+./scripts/db-backup.sh backup ./backups/$(date +%F)
+docker compose start memmachine
+
+# Restore (OVERWRITES the live databases)
+docker compose stop memmachine
+./scripts/db-backup.sh restore ./backups/2026-07-02
+docker compose start memmachine
+```
+
+The backup dir contains `postgres.dump` + `neo4j.dump` (binary, used by restore),
+`neo4j.cypher` (portable text export, not used by restore), `llm_cache.db`, and a
+copy of your config. Restore uses the fast binary Neo4j load (~seconds); replaying
+the large `neo4j.cypher` would take far longer, so it is intentionally not the
+restore path.
+
+### Incremental replication to a remote mirror
+
+The remote is seeded once from a full backup, then kept current by shipping small
+increment bundles. Adds, updates, and deletes all propagate; applies are
+idempotent and must be applied in order.
+
+**1. Establish the baseline (run together, app stopped, so they are consistent):**
+
+```bash
+# SOURCE
+docker compose stop memmachine
+./scripts/db-backup.sh backup ./baseline
+./scripts/db-sync-export.sh baseline      # seeds sync cursors/manifest to match
+docker compose start memmachine
+# ship ./baseline to the remote host, then on the REMOTE:
+docker compose stop memmachine
+./scripts/db-backup.sh restore ./baseline
+# leave the remote app stopped — it is a read-only mirror
+```
+
+**2. Sync periodically:**
+
+```bash
+# SOURCE (online — no need to stop the app)
+./scripts/db-sync-export.sh export ./outgoing
+# -> writes ./outgoing/bundle-NNNNNN ; ship it to the remote (rsync/scp/etc.)
+
+# REMOTE — apply bundles strictly in order (already-applied bundles are skipped)
+./scripts/db-sync-apply.sh ./incoming/bundle-000001
+```
+
+How each store is handled: `llm_cache` ships new rows (`INSERT OR IGNORE`); Neo4j
+diffs a node-uid manifest (new subgraph added, removed uids `DETACH DELETE`d);
+Postgres ships a full dump each run (it is small, and a snapshot inherently
+carries updates + deletes). Runtime state lives in `.sync-state/` (source) and
+`.sync-state-remote/` (remote) — both git-ignored. Bundle transport between hosts
+is up to you.
+
 ## Services
 
 - **PostgreSQL** (port 5432): Profile memory storage with pgvector
