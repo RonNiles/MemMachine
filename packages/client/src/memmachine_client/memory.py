@@ -371,6 +371,7 @@ class Memory:
         set_metadata: dict[str, JsonValue] | None = None,
         agent_mode: bool = False,
         load_citations: bool = False,
+        use_fts: bool = False,
     ) -> SearchResult:
         """
         Search for memories.
@@ -403,6 +404,7 @@ class Memory:
             set_metadata: Optional metadata key-value pairs used to select semantic sets.
             agent_mode: Whether to enable top-level retrieval-agent orchestration.
             load_citations: Whether to load source episode IDs for semantic results.
+            use_fts: Whether to enable hybrid Vector + Full-Text Search for episodic results.
 
         Returns:
             SearchResult object containing search results from both episodic and semantic memory
@@ -444,6 +446,7 @@ class Memory:
             score_threshold=score_threshold,
             agent_mode=agent_mode,
             load_citations=load_citations,
+            use_fts=use_fts,
             filter=filter_str,
             set_metadata=set_metadata,
             types=[MemoryType.Episodic, MemoryType.Semantic],  # Search both types
