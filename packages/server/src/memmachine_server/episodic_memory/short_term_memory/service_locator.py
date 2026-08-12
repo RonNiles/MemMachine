@@ -11,6 +11,7 @@ from .short_term_memory import ShortTermMemoryParams
 async def short_term_memory_params_from_config(
     config: ShortTermMemoryConf,
     resource_manager: InstanceOf[CommonResourceManager],
+    deterministic_ingestion: bool = False,
 ) -> ShortTermMemoryParams:
     """Create ShortTermMemoryParams from configuration and common resources."""
     session_data_manager = await resource_manager.get_session_data_manager()
@@ -23,4 +24,5 @@ async def short_term_memory_params_from_config(
         summary_prompt_system=config.summary_prompt_system,
         summary_prompt_user=config.summary_prompt_user,
         message_capacity=config.message_capacity,
+        deterministic_ingestion=deterministic_ingestion,
     )

@@ -1354,3 +1354,233 @@ async def test_deduplicate_features_context_length_does_not_raise_in_debug_mode(
 
     assert await semantic_storage.get_feature(id1) is not None
     assert await semantic_storage.get_feature(id2) is not None
+
+
+@pytest.mark.asyncio
+async def test_deterministic_ingestion_consolidates_per_message(
+    semantic_storage: SemanticStorage,
+    episode_storage: EpisodeStorage,
+    resource_retriever: MockResourceRetriever,
+    semantic_category: SemanticCategory,
+    monkeypatch,
+):
+    """With deterministic_ingestion, consolidation is checked after each
+    message (so trigger points depend only on the message sequence), and the
+    per-cycle consolidation pass is skipped."""
+    first_id = await add_history(episode_storage, content="message one")
+    second_id = await add_history(episode_storage, content="message two")
+    await semantic_storage.add_history_to_set(set_id="user-det", history_id=first_id)
+    await semantic_storage.add_history_to_set(set_id="user-det", history_id=second_id)
+
+    llm_mock = AsyncMock(return_value=[])
+    monkeypatch.setattr(
+        "memmachine_server.semantic_memory.semantic_ingestion.llm_feature_update",
+        llm_mock,
+    )
+
+    ingestion_service = IngestionService(
+        IngestionService.Params(
+            semantic_storage=semantic_storage,
+            history_store=episode_storage,
+            resource_retriever=resource_retriever.get_resources,
+            consolidated_threshold=2,
+            deterministic_ingestion=True,
+        )
+    )
+
+    consolidate_category_mock = AsyncMock()
+    monkeypatch.setattr(
+        ingestion_service, "_consolidate_category", consolidate_category_mock
+    )
+    cycle_consolidate_mock = AsyncMock()
+    monkeypatch.setattr(
+        ingestion_service,
+        "_consolidate_set_memories_if_applicable",
+        cycle_consolidate_mock,
+    )
+
+    await ingestion_service._process_single_set("user-det")
+
+    # One consolidation check per message, none at the end of the cycle.
+    assert consolidate_category_mock.await_count == 2
+    cycle_consolidate_mock.assert_not_awaited()
+    for call in consolidate_category_mock.await_args_list:
+        assert call.kwargs["set_id"] == "user-det"
+        assert call.kwargs["semantic_category"] == semantic_category
+
+
+@pytest.mark.asyncio
+async def test_default_mode_consolidates_once_per_cycle(
+    semantic_storage: SemanticStorage,
+    episode_storage: EpisodeStorage,
+    resource_retriever: MockResourceRetriever,
+    semantic_category: SemanticCategory,
+    monkeypatch,
+):
+    """Without deterministic_ingestion, consolidation runs once at the end of
+    the polling cycle (the pre-existing behavior)."""
+    first_id = await add_history(episode_storage, content="message one")
+    second_id = await add_history(episode_storage, content="message two")
+    await semantic_storage.add_history_to_set(set_id="user-cyc", history_id=first_id)
+    await semantic_storage.add_history_to_set(set_id="user-cyc", history_id=second_id)
+
+    llm_mock = AsyncMock(return_value=[])
+    monkeypatch.setattr(
+        "memmachine_server.semantic_memory.semantic_ingestion.llm_feature_update",
+        llm_mock,
+    )
+
+    ingestion_service = IngestionService(
+        IngestionService.Params(
+            semantic_storage=semantic_storage,
+            history_store=episode_storage,
+            resource_retriever=resource_retriever.get_resources,
+            consolidated_threshold=2,
+        )
+    )
+
+    consolidate_category_mock = AsyncMock()
+    monkeypatch.setattr(
+        ingestion_service, "_consolidate_category", consolidate_category_mock
+    )
+
+    await ingestion_service._process_single_set("user-cyc")
+
+    # The per-cycle pass fans out to _consolidate_category exactly once per
+    # category; no per-message checks happen.
+    assert consolidate_category_mock.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_apply_add_command_updates_existing_feature_in_place(
+    ingestion_service: IngestionService,
+    semantic_storage: SemanticStorage,
+    embedder_double: MockEmbedder,
+    semantic_category: SemanticCategory,
+):
+    """An ADD for an existing (tag, feature) updates the row instead of
+    inserting a duplicate, merging the new citation and re-embedding the
+    changed value."""
+    set_id = "user-123"
+    await semantic_storage.add_feature(
+        set_id=set_id,
+        category_name=semantic_category.name,
+        feature="favorite_car",
+        value="blue",
+        tag="car",
+        embedding=np.array([1.0, 1.0]),
+    )
+
+    await ingestion_service._apply_commands(
+        commands=[
+            SemanticCommand(
+                command=SemanticCommandType.ADD,
+                feature="favorite_car",
+                tag="car",
+                value="red",
+            ),
+        ],
+        set_id=set_id,
+        category_name=semantic_category.name,
+        citation_id="ep-1",
+        embedder=embedder_double,
+    )
+
+    features = await _collect(
+        semantic_storage.get_feature_set(
+            filter_expr=parse_filter(
+                f"set_id IN ('{set_id}') "
+                f"AND category_name IN ('{semantic_category.name}')"
+            ),
+            load_citations=True,
+        )
+    )
+    # Exactly one row — no duplicate — with the updated value and the citation.
+    assert len(features) == 1
+    assert features[0].feature_name == "favorite_car"
+    assert features[0].value == "red"
+    assert list(features[0].metadata.citations or []) == ["ep-1"]
+    # Value changed, so it was re-embedded exactly once.
+    assert embedder_double.ingest_calls == [["red"]]
+
+
+@pytest.mark.asyncio
+async def test_apply_add_command_identical_value_skips_reembed(
+    ingestion_service: IngestionService,
+    semantic_storage: SemanticStorage,
+    embedder_double: MockEmbedder,
+    semantic_category: SemanticCategory,
+):
+    """Re-adding an identical (tag, feature, value) merges the citation but
+    does not insert a row or spend an embedding call."""
+    set_id = "user-123"
+    await semantic_storage.add_feature(
+        set_id=set_id,
+        category_name=semantic_category.name,
+        feature="favorite_car",
+        value="blue",
+        tag="car",
+        embedding=np.array([1.0, 1.0]),
+    )
+
+    await ingestion_service._apply_commands(
+        commands=[
+            SemanticCommand(
+                command=SemanticCommandType.ADD,
+                feature="favorite_car",
+                tag="car",
+                value="blue",
+            ),
+        ],
+        set_id=set_id,
+        category_name=semantic_category.name,
+        citation_id="ep-1",
+        embedder=embedder_double,
+    )
+
+    features = await _collect(
+        semantic_storage.get_feature_set(
+            filter_expr=parse_filter(f"set_id IN ('{set_id}')"),
+            load_citations=True,
+        )
+    )
+    assert len(features) == 1
+    assert features[0].value == "blue"
+    assert list(features[0].metadata.citations or []) == ["ep-1"]
+    # Identical value -> no embedding call.
+    assert embedder_double.ingest_calls == []
+
+
+@pytest.mark.asyncio
+async def test_repeated_add_does_not_accumulate_duplicates(
+    ingestion_service: IngestionService,
+    semantic_storage: SemanticStorage,
+    embedder_double: MockEmbedder,
+    semantic_category: SemanticCategory,
+):
+    """The core fix: re-emitting ADD for the same feature across many
+    messages collapses to a single row rather than piling up duplicates
+    (the bug that ballooned consolidation prompts)."""
+    set_id = "user-123"
+    for i in range(5):
+        await ingestion_service._apply_commands(
+            commands=[
+                SemanticCommand(
+                    command=SemanticCommandType.ADD,
+                    feature="favorite_car",
+                    tag="car",
+                    value="blue",
+                ),
+            ],
+            set_id=set_id,
+            category_name=semantic_category.name,
+            citation_id=f"ep-{i}",
+            embedder=embedder_double,
+        )
+
+    features = await _collect(
+        semantic_storage.get_feature_set(
+            filter_expr=parse_filter(f"set_id IN ('{set_id}')"),
+        )
+    )
+    assert len(features) == 1

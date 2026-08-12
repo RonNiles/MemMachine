@@ -435,6 +435,88 @@ async def test_number_of_uningested_messages_delegates(
     assert count == 7
 
 
+async def test_list_ingestion_statuses_list_all_yields_pending_sets(
+    session_manager: SemanticSessionManager,
+    episode_storage: EpisodeStorage,
+    session_data,
+):
+    """list_all mode (no set_metadata) must yield every pending set under scope.
+
+    Regression for the bug where ``list_ingestion_statuses`` filtered with the
+    bare ``org_<org>_project_<proj>`` prefix while real set_ids start with
+    ``mem_<type>_``. The startswith() check never matched, so list-all always
+    returned empty.
+    """
+    episodes = await episode_storage.add_episodes(
+        session_key="session_id",
+        episodes=[
+            EpisodeEntry(
+                content="Tracked memory",
+                producer_id="alice",
+                producer_role="user",
+            )
+        ],
+    )
+    await session_manager.add_message(session_data=session_data, episodes=episodes)
+
+    statuses = await _collect_async(
+        session_manager.list_ingestion_statuses(session_data=session_data)
+    )
+
+    yielded_set_ids = {s.set_id for s in statuses}
+    expected_project_set = session_manager._generate_set_id(
+        org_id=session_data.org_id,
+        project_id=session_data.project_id,
+        metadata={},
+    )
+    expected_user_set = session_manager._generate_set_id(
+        org_id=session_data.org_id,
+        metadata={"producer_id": "alice"},
+    )
+
+    assert expected_project_set in yielded_set_ids
+    assert expected_user_set in yielded_set_ids
+    assert all(s.pending_message_count >= 1 for s in statuses)
+
+
+async def test_list_ingestion_statuses_list_all_scoped_to_project(
+    session_manager: SemanticSessionManager,
+    episode_storage: EpisodeStorage,
+    session_data,
+):
+    """Pending sets from a different project under the same org are not yielded."""
+    other_project = _SessionData(org_id=session_data.org_id, project_id="other_proj")
+
+    own_episodes = await episode_storage.add_episodes(
+        session_key="own_session",
+        episodes=[
+            EpisodeEntry(content="own", producer_id="alice", producer_role="user")
+        ],
+    )
+    other_episodes = await episode_storage.add_episodes(
+        session_key="other_session",
+        episodes=[
+            EpisodeEntry(content="other", producer_id="bob", producer_role="user")
+        ],
+    )
+    await session_manager.add_message(session_data=session_data, episodes=own_episodes)
+    await session_manager.add_message(
+        session_data=other_project, episodes=other_episodes
+    )
+
+    own_statuses = await _collect_async(
+        session_manager.list_ingestion_statuses(session_data=session_data)
+    )
+
+    own_yielded = {s.set_id for s in own_statuses}
+    foreign_project_set = session_manager._generate_set_id(
+        org_id=other_project.org_id,
+        project_id=other_project.project_id,
+        metadata={},
+    )
+    assert foreign_project_set not in own_yielded
+
+
 async def test_add_feature_translates_to_single_set(
     mock_session_manager: SemanticSessionManager,
     mock_semantic_service: MagicMock,

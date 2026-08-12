@@ -69,6 +69,13 @@ class OpenAIChatCompletionsLanguageModelParams(BaseModel):
         None,
         description="An instance of MetricsFactory for collecting usage metrics",
     )
+    temperature: float | None = Field(
+        None,
+        description=(
+            "Sampling temperature. 0 gives (near-)deterministic output. "
+            "If None, the API default is used."
+        ),
+    )
 
 
 class OpenAIChatCompletionsLanguageModel(LanguageModel):
@@ -90,6 +97,12 @@ class OpenAIChatCompletionsLanguageModel(LanguageModel):
         self._model = params.model
 
         self._max_retry_interval_seconds = params.max_retry_interval_seconds
+
+        # Optional sampling params merged into every request; omitted entirely
+        # when None so the provider default is used.
+        self._sampling_kwargs: dict[str, Any] = {}
+        if params.temperature is not None:
+            self._sampling_kwargs["temperature"] = params.temperature
 
         metrics_factory = params.metrics_factory
 
@@ -233,7 +246,9 @@ class OpenAIChatCompletionsLanguageModel(LanguageModel):
         sleep_seconds = 1
         for attempt in range(1, max_attempts + 1):
             try:
-                return await self._client.chat.completions.create(**args)
+                return await self._client.chat.completions.create(
+                    **args, **self._sampling_kwargs
+                )
             except (
                 openai.RateLimitError,
                 openai.APITimeoutError,

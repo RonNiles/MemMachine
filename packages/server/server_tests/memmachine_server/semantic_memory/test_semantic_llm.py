@@ -1,3 +1,4 @@
+from typing import ClassVar
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -442,3 +443,171 @@ class TestNonAsciiPromptSerialization:
             "食べ物": {"favorite_dish": "寿司 🍣"},
             "préférences": {"café": "naïve résumé — Привет"},
         }
+
+
+class TestDeterministicIngestionPromptStability:
+    """In deterministic mode the update/consolidation prompts must depend only
+    on feature *content* (tag, feature, value) — never on DB insertion order or
+    ephemeral row ids. Otherwise the LLM cache can't hit across DB-cleared
+    reruns, which is the whole point of ``deterministic_ingestion``."""
+
+    # Same three features every "run"; the caller supplies the run-specific
+    # ids and ordering. Sorted by (tag, feature_name, value) the deterministic
+    # order is: drink/favorite_drink, food/favorite_bread, food/favorite_pizza.
+    _DEFS: ClassVar[list[tuple[str, str, str, str]]] = [
+        ("Profile", "food", "favorite_pizza", "pepperoni"),
+        ("Profile", "food", "favorite_bread", "whole grain"),
+        ("Profile", "drink", "favorite_drink", "water"),
+    ]
+
+    @classmethod
+    def _features(cls, ids: list[str]) -> list[SemanticFeature]:
+        return [
+            SemanticFeature(
+                category=c,
+                tag=t,
+                feature_name=fn,
+                value=v,
+                metadata=SemanticFeature.Metadata(id=i),
+            )
+            for (c, t, fn, v), i in zip(cls._DEFS, ids, strict=True)
+        ]
+
+    def test_old_profile_render_is_order_independent(self):
+        import json
+
+        run_a = self._features(["100", "200", "300"])
+        run_b = list(reversed(self._features(["900", "910", "920"])))
+
+        a = json.dumps(
+            _features_to_llm_format(run_a, deterministic=True), ensure_ascii=False
+        )
+        b = json.dumps(
+            _features_to_llm_format(run_b, deterministic=True), ensure_ascii=False
+        )
+
+        # Byte-identical despite different input order...
+        assert a == b
+        # ...and the update prompt never leaks DB ids.
+        for db_id in ("100", "200", "300", "900", "910", "920"):
+            assert db_id not in a
+
+    def test_consolidation_render_uses_positional_ids(self):
+        run = self._features(["100", "200", "300"])
+        ordered = sorted(run, key=lambda f: (f.tag, f.feature_name, f.value))
+
+        formatted = _features_to_consolidation_format(ordered, deterministic=True)
+
+        # Ids are positions (0..N-1), not the real DB row ids.
+        assert [e["metadata"]["id"] for e in formatted] == ["0", "1", "2"]
+        # Content is still present and correctly ordered.
+        assert formatted[0]["feature"] == "favorite_drink"
+        assert formatted[2]["feature"] == "favorite_pizza"
+
+    @pytest.mark.asyncio
+    async def test_consolidation_prompt_identical_across_db_cleared_runs(
+        self, magic_mock_llm_model: MagicMock
+    ):
+        magic_mock_llm_model.generate_parsed_response.return_value = {
+            "keep_memories": [],
+            "consolidated_memories": [],
+        }
+
+        await llm_consolidate_features(
+            features=self._features(["100", "200", "300"]),
+            model=magic_mock_llm_model,
+            consolidate_prompt="Consolidate",
+            deterministic=True,
+        )
+        prompt_a = magic_mock_llm_model.generate_parsed_response.call_args.kwargs[
+            "user_prompt"
+        ]
+
+        # Second "run": features inserted in a different order with different
+        # DB ids (as happens after a DB wipe + concurrent re-adds).
+        await llm_consolidate_features(
+            features=list(reversed(self._features(["900", "910", "920"]))),
+            model=magic_mock_llm_model,
+            consolidate_prompt="Consolidate",
+            deterministic=True,
+        )
+        prompt_b = magic_mock_llm_model.generate_parsed_response.call_args.kwargs[
+            "user_prompt"
+        ]
+
+        assert prompt_a == prompt_b
+
+    @pytest.mark.asyncio
+    async def test_consolidation_maps_positional_keep_ids_back_to_real_ids(
+        self, magic_mock_llm_model: MagicMock
+    ):
+        # The (cached) LLM response keeps position 0, which in deterministic
+        # sorted order is the drink/favorite_drink feature.
+        magic_mock_llm_model.generate_parsed_response.return_value = {
+            "keep_memories": ["0"],
+            "consolidated_memories": [],
+        }
+
+        result_a = await llm_consolidate_features(
+            features=self._features(["100", "200", "300"]),
+            model=magic_mock_llm_model,
+            consolidate_prompt="Consolidate",
+            deterministic=True,
+        )
+        # drink/favorite_drink had id "300" in run A.
+        assert result_a is not None
+        assert result_a.keep_memories == ["300"]
+
+        # Same position, different run-specific ids -> resolves to that run's
+        # id for the same logical feature ("920").
+        result_b = await llm_consolidate_features(
+            features=list(reversed(self._features(["900", "910", "920"]))),
+            model=magic_mock_llm_model,
+            consolidate_prompt="Consolidate",
+            deterministic=True,
+        )
+        assert result_b is not None
+        assert result_b.keep_memories == ["920"]
+
+    @pytest.mark.asyncio
+    async def test_consolidation_drops_out_of_range_positions(
+        self, magic_mock_llm_model: MagicMock
+    ):
+        magic_mock_llm_model.generate_parsed_response.return_value = {
+            "keep_memories": ["0", "99", "not-an-int"],
+            "consolidated_memories": [],
+        }
+
+        result = await llm_consolidate_features(
+            features=self._features(["100", "200", "300"]),
+            model=magic_mock_llm_model,
+            consolidate_prompt="Consolidate",
+            deterministic=True,
+        )
+        # Only the valid position 0 -> "300" survives.
+        assert result is not None
+        assert result.keep_memories == ["300"]
+
+    @pytest.mark.asyncio
+    async def test_default_mode_unchanged_keeps_real_ids_and_db_order(
+        self, magic_mock_llm_model: MagicMock
+    ):
+        magic_mock_llm_model.generate_parsed_response.return_value = {
+            "keep_memories": ["200"],
+            "consolidated_memories": [],
+        }
+
+        run = self._features(["100", "200", "300"])
+        result = await llm_consolidate_features(
+            features=run,
+            model=magic_mock_llm_model,
+            consolidate_prompt="Consolidate",
+        )
+        # Without deterministic mode the prompt carries real ids and
+        # keep_memories passes through untranslated.
+        prompt = magic_mock_llm_model.generate_parsed_response.call_args.kwargs[
+            "user_prompt"
+        ]
+        assert '"id": "100"' in prompt
+        assert result is not None
+        assert result.keep_memories == ["200"]

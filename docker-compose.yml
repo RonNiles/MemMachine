@@ -91,6 +91,9 @@ services:
     volumes:
       - ./configuration.yml:/app/configuration.yml:rw,Z
       - memmachine_logs:/tmp/memory_logs
+      # Uncomment to persist the optional LLM cache (see llm_cache in
+      # configuration.yml) on the host; set llm_cache.path: /app/cache/llm_cache.db
+      # - ./cache:/app/cache:rw,Z
     depends_on:
       postgres:
         condition: service_healthy
