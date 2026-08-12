@@ -4,30 +4,30 @@ import json
 import os
 import time
 
-import boto3
 import neo4j
 from dotenv import load_dotenv
+from llm_cache_util import cached_chat_completion
 from longmemeval_models import (
     LongMemEvalItem,
     get_datetime_from_timestamp,
-    load_longmemeval_dataset,
+    iter_longmemeval_dataset,
 )
+from memmachine_server.common.cache.llm_cache_store import LLMCacheStore
+from memmachine_server.common.embedder.caching_embedder import CachingEmbedder
 from memmachine_server.common.embedder.openai_embedder import (
     OpenAIEmbedder,
     OpenAIEmbedderParams,
 )
-from memmachine_server.common.reranker.amazon_bedrock_reranker import (
-    AmazonBedrockReranker,
-    AmazonBedrockRerankerParams,
-)
+from memmachine_server.common.episode_store.episode_model import episodes_to_string
+from memmachine_server.common.reranker.identity_reranker import IdentityReranker
 from memmachine_server.common.utils import async_with
 from memmachine_server.common.vector_graph_store.neo4j_vector_graph_store import (
     Neo4jVectorGraphStore,
     Neo4jVectorGraphStoreParams,
 )
-from memmachine_server.episodic_memory.declarative_memory import (
-    DeclarativeMemory,
-    DeclarativeMemoryParams,
+from memmachine_server.episodic_memory.long_term_memory.long_term_memory import (
+    DeclarativeBackendParams,
+    LongTermMemory,
 )
 from openai import AsyncOpenAI
 
@@ -61,13 +61,63 @@ async def main():
     parser.add_argument(
         "--target-path", required=True, help="Path to the target data file"
     )
-
+    parser.add_argument(
+        "--use-fts",
+        action="store_true",
+        help="Enable hybrid Vector + FTS retrieval instead of vector-only",
+    )
+    parser.add_argument(
+        "--fusion",
+        choices=["rrf", "append"],
+        default="rrf",
+        help="Hybrid fusion strategy when --use-fts is set: 'rrf' (Reciprocal "
+        "Rank Fusion) or 'append' (original PR method: append FTS top-10 to the "
+        "vector list). Ignored without --use-fts.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Query only the FIRST N questions (all one question_type; smoke "
+        "tests only). Must match the --limit used at ingest time.",
+    )
+    parser.add_argument(
+        "--sample",
+        type=int,
+        default=None,
+        help="Query N evenly-spaced questions spanning all question types. Must "
+        "match the --sample used at ingest time.",
+    )
+    parser.add_argument(
+        "--embedding-cache",
+        default=None,
+        help="Path to an LLM cache SQLite file (e.g. ./llm_cache.db) to cache the "
+        "per-question query embeddings across runs. Omit to disable.",
+    )
+    parser.add_argument(
+        "--embedding-model",
+        default="text-embedding-3-small",
+        help="Embedding model id (e.g. Qwen/Qwen3-Embedding-4B). Must match the "
+        "value used at ingest time.",
+    )
+    parser.add_argument(
+        "--embedding-dimensions",
+        type=int,
+        default=1536,
+        help="Embedding dimensionality (e.g. 2560 for Qwen3-Embedding-4B). Must "
+        "match the value used at ingest time.",
+    )
+    parser.add_argument(
+        "--embedding-base-url",
+        default=None,
+        help="OpenAI-compatible base URL for the embedding provider (e.g. "
+        "https://api.deepinfra.com/v1/openai). Omit to use OpenAI. The API key "
+        "comes from EMBEDDING_API_KEY, falling back to OPENAI_API_KEY.",
+    )
     args = parser.parse_args()
 
     data_path = args.data_path
     target_path = args.target_path
-
-    all_questions = load_longmemeval_dataset(data_path)
 
     neo4j_driver = neo4j.AsyncGraphDatabase.driver(
         uri=os.getenv("NEO4J_URI"),
@@ -86,31 +136,51 @@ async def main():
 
     openai_client = AsyncOpenAI(
         api_key=os.getenv("OPENAI_API_KEY"),
+        # Answer generation over 100-episode prompts is token-heavy and can
+        # burst past the model's TPM limit; let the SDK back off and retry
+        # (it honors the 429 Retry-After) instead of crashing the whole run,
+        # which would discard all results (they are only written at the end).
+        max_retries=10,
+    )
+
+    # Embeddings may come from a different OpenAI-compatible provider than the
+    # answer-generation model (e.g. a hosted Qwen embedder), so give it its own
+    # client and key (EMBEDDING_API_KEY, falling back to OPENAI_API_KEY). It
+    # must match the embedder used at ingest so queries land in the same space.
+    # High max_retries rides out transient provider overload (e.g. DeepInfra
+    # 429 "engine_overloaded") with backoff, as the embedder uses max_attempts=1.
+    embedding_client = AsyncOpenAI(
+        api_key=os.getenv("EMBEDDING_API_KEY") or os.getenv("OPENAI_API_KEY"),
+        base_url=args.embedding_base_url,
+        max_retries=8,
     )
 
     embedder = OpenAIEmbedder(
         OpenAIEmbedderParams(
-            client=openai_client,
-            model="text-embedding-3-small",
-            dimensions=1536,
+            client=embedding_client,
+            model=args.embedding_model,
+            dimensions=args.embedding_dimensions,
         )
     )
 
-    region = "us-west-2"
-    aws_client = boto3.client(
-        "bedrock-agent-runtime",
-        region_name=region,
-        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-    )
-
-    reranker = AmazonBedrockReranker(
-        AmazonBedrockRerankerParams(
-            client=aws_client,
-            region=region,
-            model_id="cohere.rerank-v3-5:0",
+    # Optionally cache query embeddings so re-runs (and the vector→FTS pair)
+    # reuse them instead of re-calling the provider. Query embeddings are keyed
+    # under a distinct "search" mode, so they never collide with ingest's
+    # cached derivative embeddings even in the same cache file.
+    cache_store: LLMCacheStore | None = None
+    if args.embedding_cache:
+        cache_store = LLMCacheStore(args.embedding_cache)
+        await cache_store.startup()
+        signature = LLMCacheStore.model_signature(
+            provider="openai",
+            model=args.embedding_model,
+            dimensions=args.embedding_dimensions,
         )
-    )
+        embedder = CachingEmbedder(embedder, signature, cache_store)
+        print(f"Embedding cache enabled: {args.embedding_cache}", flush=True)
+
+    # "No reranker": IdentityReranker preserves retrieval order without reordering.
+    reranker = IdentityReranker()
 
     async def qa_eval(
         memories,
@@ -118,30 +188,27 @@ async def main():
         question: str,
         model: str = "gpt-5-mini",
     ):
-        start_time = time.monotonic()
-        response = await openai_client.chat.completions.create(
-            model=model,
-            messages=[
-                {
-                    "role": "user",
-                    "content": ANSWER_PROMPT.format(
-                        memories=memories,
-                        question_timestamp=question_timestamp,
-                        question=question,
-                    ),
-                },
-            ],
+        messages = [
+            {
+                "role": "user",
+                "content": ANSWER_PROMPT.format(
+                    memories=memories,
+                    question_timestamp=question_timestamp,
+                    question=question,
+                ),
+            },
+        ]
+        # Served from the shared cache (same --embedding-cache .db) when set, so
+        # a re-run or crash-resume reuses answers instead of re-billing.
+        result = await cached_chat_completion(
+            cache_store, openai_client, model=model, messages=messages
         )
-        end_time = time.monotonic()
-
-        latency = end_time - start_time
-
         return {
-            "response": response.choices[0].message.content.strip(),
-            "input_tokens": response.usage.prompt_tokens,
-            "output_tokens": response.usage.completion_tokens,
-            "total_tokens": response.usage.total_tokens,
-            "latency": latency,
+            "response": result["content"],
+            "input_tokens": result["input_tokens"],
+            "output_tokens": result["output_tokens"],
+            "total_tokens": result["input_tokens"] + result["output_tokens"],
+            "latency": result["latency"],
         }
 
     async def process_question(
@@ -149,12 +216,13 @@ async def main():
     ):
         group_id = question.question_id
 
-        memory = DeclarativeMemory(
-            DeclarativeMemoryParams(
+        long_term_memory = LongTermMemory(
+            DeclarativeBackendParams(
                 session_id=group_id,
                 vector_graph_store=vector_graph_store,
                 embedder=embedder,
                 reranker=reranker,
+                message_sentence_chunking=True,
             )
         )
 
@@ -162,13 +230,18 @@ async def main():
 
         total_start = time.monotonic()
         memory_start = time.monotonic()
-        chunks = await memory.search(
-            query=search_query, max_num_episodes=100, expand_context=0
+        # use_fts=False -> vector-only; use_fts=True -> Vector + FTS fused via RRF.
+        scored = await long_term_memory.search_scored(
+            query=search_query,
+            num_episodes_limit=100,
+            expand_context=0,
+            use_fts=args.use_fts,
+            fusion=args.fusion,
         )
         memory_end = time.monotonic()
         memory_latency = memory_end - memory_start
 
-        formatted_context = memory.string_from_episode_context(chunks)
+        formatted_context = episodes_to_string([episode for _, episode in scored])
 
         response = await qa_eval(
             formatted_context,
@@ -208,17 +281,34 @@ async def main():
         }
 
     semaphore = asyncio.Semaphore(5)
-    tasks = [
-        async_with(
-            semaphore,
-            process_question(question),
+
+    # Stream questions so the multi-GB dataset is never fully resident. Keep a
+    # bounded window of in-flight searches; collect results as they finish.
+    # Order-independent: each result carries its own question_id/answer, and
+    # evaluation scores results item-by-item.
+    max_outstanding = 10
+    results = []
+    in_flight: set = set()
+    for question in iter_longmemeval_dataset(
+        data_path, limit=args.limit, sample=args.sample
+    ):
+        in_flight.add(
+            asyncio.create_task(async_with(semaphore, process_question(question)))
         )
-        for question in all_questions
-    ]
-    results = await asyncio.gather(*tasks)
+        if len(in_flight) >= max_outstanding:
+            done, in_flight = await asyncio.wait(
+                in_flight, return_when=asyncio.FIRST_COMPLETED
+            )
+            results.extend(task.result() for task in done)
+    if in_flight:
+        done, _ = await asyncio.wait(in_flight)
+        results.extend(task.result() for task in done)
 
     with open(target_path, "w") as f:
         json.dump(results, f, indent=4)
+
+    if cache_store is not None:
+        await cache_store.close()
 
 
 if __name__ == "__main__":
