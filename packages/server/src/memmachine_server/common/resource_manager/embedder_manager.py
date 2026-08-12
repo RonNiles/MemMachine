@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from memmachine_server.common.cache import LLMCacheStore
 from memmachine_server.common.embedder import Embedder
 from memmachine_server.common.errors import InvalidEmbedderError
 from memmachine_server.common.resource_manager.base_manager import BaseResourceManager
@@ -23,10 +24,13 @@ logger = logging.getLogger(__name__)
 class EmbedderManager(BaseResourceManager[Embedder]):
     """Create and cache embedders defined in configuration."""
 
-    def __init__(self, conf: EmbeddersConf) -> None:
+    def __init__(
+        self, conf: EmbeddersConf, cache_store: LLMCacheStore | None = None
+    ) -> None:
         """Store embedder configuration and initialize caches."""
         super().__init__()
         self.conf = conf
+        self._cache_store = cache_store
         # Alias for backward compatibility
         self._embedders = self._resources
 
@@ -155,7 +159,43 @@ class EmbedderManager(BaseResourceManager[Embedder]):
             raise InvalidEmbedderError(f"Embedder with name {name} not found.")
         if validate:
             await self._validate_embedder(name, ret)
+        # Wrap after validation so the validation probe hits the real provider
+        # and is not seeded into the cache.
+        if self._cache_store is not None:
+            from memmachine_server.common.embedder.caching_embedder import (
+                CachingEmbedder,
+            )
+
+            signature = self._embedder_signature(name)
+            ret = CachingEmbedder(ret, signature, self._cache_store)
+            logger.info("Embedder '%s' wrapped with persistent LLM cache.", name)
         return ret
+
+    def _embedder_signature(self, name: str) -> str:
+        """Build a cache model signature from the embedder's configuration."""
+        if name in self.conf.openai:
+            conf = self.conf.openai[name]
+            return LLMCacheStore.model_signature(
+                provider="openai",
+                model=conf.model,
+                dimensions=conf.dimensions or 1536,
+                base_url=conf.base_url,
+                max_input_length=conf.max_input_length,
+            )
+        if name in self.conf.amazon_bedrock:
+            conf = self.conf.amazon_bedrock[name]
+            return LLMCacheStore.model_signature(
+                provider="amazon-bedrock",
+                model_id=conf.model_id,
+                region=conf.region,
+                max_input_length=conf.max_input_length,
+            )
+        conf = self.conf.sentence_transformer[name]
+        return LLMCacheStore.model_signature(
+            provider="sentence-transformer",
+            model=conf.model,
+            max_input_length=conf.max_input_length,
+        )
 
     def _build_amazon_bedrock_embedders(self, name: str) -> Embedder:
         conf = self.conf.amazon_bedrock[name]

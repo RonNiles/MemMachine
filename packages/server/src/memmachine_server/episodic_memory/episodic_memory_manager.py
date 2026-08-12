@@ -58,6 +58,13 @@ class EpisodicMemoryManagerParams(BaseModel):
         ...,
         description="Session data manager",
     )
+    deterministic_ingestion: bool = Field(
+        default=False,
+        description=(
+            "Make ingestion-side LLM call sequences deterministic for "
+            "cache hits on reruns"
+        ),
+    )
 
 
 class EpisodicMemoryManager:
@@ -85,6 +92,7 @@ class EpisodicMemoryManager:
         )
         self._resource_manager = params.resource_manager
         self._session_data_manager = params.session_data_manager
+        self._deterministic_ingestion = params.deterministic_ingestion
 
         self._session_locks: defaultdict[str, rw_locks.AsyncRWLock] = defaultdict(
             rw_locks.AsyncRWLock
@@ -170,6 +178,7 @@ class EpisodicMemoryManager:
         episodic_memory_params = await episodic_memory_params_from_config(
             conf,
             self._resource_manager,
+            deterministic_ingestion=self._deterministic_ingestion,
         )
         instance = EpisodicMemory(episodic_memory_params)
         await self._instance_cache.add(session_key, instance)
@@ -312,6 +321,7 @@ class EpisodicMemoryManager:
                     params = await episodic_memory_params_from_config(
                         session_info.episode_memory_conf,
                         self._resource_manager,
+                        deterministic_ingestion=self._deterministic_ingestion,
                     )
                     instance = EpisodicMemory(params)
                 await instance.delete_session_episodes()

@@ -154,6 +154,7 @@ async def test_create_episodic_memory_success(
             mock_params_from_config.assert_awaited_once_with(
                 mock_episodic_memory_conf,
                 manager._resource_manager,
+                deterministic_ingestion=False,
             )
             mock_episodic_memory_cls.assert_called_once_with(
                 mock_params_from_config.return_value,

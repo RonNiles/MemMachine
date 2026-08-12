@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import re
 import string
 import uuid
@@ -617,3 +618,94 @@ class TestSessionMemoryPublicAPI:
         )
         assert len(episodes) == 1
         assert episodes == [ep2]
+
+
+class LatencyRecordingLanguageModel(LanguageModel):
+    """Records every summary prompt and responds deterministically after a delay."""
+
+    def __init__(self, latency: float) -> None:
+        self.latency = latency
+        self.prompts: list[str] = []
+
+    async def generate_response(
+        self,
+        system_prompt: str | None = None,
+        user_prompt: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, str] | None = None,
+        max_attempts: int = 1,
+    ) -> tuple[str, Any]:
+        prompt = user_prompt or ""
+        self.prompts.append(prompt)
+        if self.latency:
+            await asyncio.sleep(self.latency)
+        # Response is a pure function of the prompt so reruns are comparable.
+        digest = hashlib.sha1(prompt.encode("utf-8")).hexdigest()[:8]
+        return f"sum-{digest}", ""
+
+    async def generate_response_with_token_usage(
+        self,
+        system_prompt: str | None = None,
+        user_prompt: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, str] | None = None,
+        max_attempts: int = 1,
+    ) -> tuple[str, Any, int, int]:
+        response, tool_output = await self.generate_response(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            tools=tools,
+            tool_choice=tool_choice,
+            max_attempts=max_attempts,
+        )
+        return response, tool_output, 0, 0
+
+    async def generate_parsed_response(
+        self,
+        output_format: type[T],
+        system_prompt: str | None = None,
+        user_prompt: str | None = None,
+        max_attempts: int = 1,
+    ) -> T:
+        return cast(T, "summary")
+
+
+@pytest.mark.asyncio
+async def test_deterministic_ingestion_summary_batches_independent_of_latency():
+    """With deterministic_ingestion, the sequence of summary prompts sent to
+    the LLM is a pure function of the add sequence — identical regardless of
+    how long each LLM call takes. This is what makes reruns of an identical
+    ingestion job hit the persistent LLM cache."""
+    fixed_time = datetime(2024, 1, 1, 12, 0, tzinfo=UTC)
+
+    def make_episode(i: int):
+        return create_test_episode(
+            uid=f"ep-{i}",
+            sequence_num=i,
+            content=f"content-{i:02d}",
+            created_at=fixed_time,
+        )
+
+    async def run_ingestion(latency: float) -> list[str]:
+        model = LatencyRecordingLanguageModel(latency)
+        params = ShortTermMemoryParams(
+            session_key="session1",
+            llm_model=model,
+            data_manager=None,
+            summary_prompt_system="System prompt",
+            summary_prompt_user="User prompt: {episodes} {summary} {max_length}",
+            message_capacity=25,
+            deterministic_ingestion=True,
+        )
+        memory = await ShortTermMemory.create(params)
+        for i in range(8):
+            await memory.add_episodes([make_episode(i)])
+        # Drain any in-flight summarization before reading the prompts.
+        await memory.get_summary()
+        return model.prompts
+
+    fast_prompts = await run_ingestion(0.0)
+    slow_prompts = await run_ingestion(0.05)
+
+    assert len(fast_prompts) >= 2, "Expected multiple summarization batches"
+    assert fast_prompts == slow_prompts

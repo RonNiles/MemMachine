@@ -45,6 +45,18 @@ data:
     session_manager:
       database: db_postgres
 
+    ## Optional persistent cache for LLM responses and embeddings. When enabled,
+    ## identical requests are served from a single portable SQLite file at
+    ## `path` instead of calling the provider. Mount a volume for `path` so the
+    ## cache survives pod restarts.
+    # llm_cache:
+    #   enabled: true
+    #   path: /data/llm_cache.db
+    #   cache_llm: true
+    #   cache_embeddings: true
+    #   emulate_latency: false
+    #   deterministic_ingestion: false  # true: deterministic ingestion-side LLM calls for cache hits on reruns
+
     prompt:
       default_project_categories:
       - profile_prompt

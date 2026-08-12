@@ -54,6 +54,16 @@ class OpenAIResponsesLanguageModelConf(
         description="Maximal retry interval in seconds when retrying API calls",
         gt=0,
     )
+    temperature: float | None = Field(
+        default=None,
+        description=(
+            "Sampling temperature. Set to 0 for (near-)deterministic output so "
+            "identical prompts reproduce across runs — required for reliable "
+            "LLM-cache hits on reruns. If None, the provider default is used."
+        ),
+        ge=0.0,
+        le=2.0,
+    )
 
     @field_validator("base_url")
     @classmethod
@@ -85,6 +95,16 @@ class OpenAIChatCompletionsLanguageModelConf(
         default=120,
         description="Maximal retry interval in seconds when retrying API calls",
         gt=0,
+    )
+    temperature: float | None = Field(
+        default=None,
+        description=(
+            "Sampling temperature. Set to 0 for (near-)deterministic output so "
+            "identical prompts reproduce across runs — required for reliable "
+            "LLM-cache hits on reruns. If None, the provider default is used."
+        ),
+        ge=0.0,
+        le=2.0,
     )
 
     @field_validator("base_url")

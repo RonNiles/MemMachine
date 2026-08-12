@@ -83,6 +83,14 @@ class ShortTermMemoryParams(BaseModel):
         gt=0,
         description="The maximum length of short-term memory",
     )
+    deterministic_ingestion: bool = Field(
+        default=False,
+        description=(
+            "Wait for in-flight summarization before deciding eviction, so "
+            "the episode batches sent to the LLM depend only on the sequence "
+            "of adds (required for LLM cache hits on reruns)"
+        ),
+    )
 
     @field_validator("summary_prompt_user")
     @classmethod
@@ -124,6 +132,7 @@ class ShortTermMemory:
         self._max_message_len = param.message_capacity
         self._current_message_len = 0
         self._session_key = param.session_key
+        self._deterministic_ingestion = param.deterministic_ingestion
         self._closed = False
         self._lock = rw_locks.AsyncRWLock()
         params = ShortTermMemoryConsolidator.Params(
@@ -203,6 +212,13 @@ class ShortTermMemory:
 
             self._current_episode_count += len(episodes)
             self._current_message_len += sum(len(e.content) for e in episodes)
+            if self._deterministic_ingestion:
+                # Settle any in-flight summarization so the fullness check
+                # (which includes the summary length) and the resulting
+                # eviction batches depend only on the sequence of adds, not
+                # on summarization timing. Required for LLM cache hits when
+                # re-running an identical ingestion job.
+                await self._consolidator.wait_until_done()
             full = await self._is_full()
             if full:
                 await self._do_evict()
