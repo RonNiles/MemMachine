@@ -77,7 +77,10 @@ As such, the data ingested will not be compatible with the full MemMachine serve
 
 ## Running the Benchmark
 
-We evaluate on `longmemeval_s_cleaned.json`.
+These steps work for any split; use `longmemeval_s_cleaned.json` or, for the
+larger haystacks, `longmemeval_m_cleaned.json` (500 questions). **Note:** the M
+split has much larger per-question haystacks than S, so expect substantially
+more disk and ingestion time than the figures below (which are for S).
 
 Get the LongMemEval dataset:
 https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/tree/main
@@ -93,16 +96,12 @@ Set up Neo4j by any method.
 > [! WARNING]
 > As configured in the scripts, ~50GB of free space on disk is required. Ingestion will take ~1.5 hours. Required disk and ingestion time can be reduced by a factor of ~5x by setting `message_sentence_chunking=False` in the ingestion script, potentially with slightly lower scores (~1-2% lower).
 
-Enable Cohere 3.5 reranker for your AWS account.
-
-The evaluation scripts use Cohere 3.5 Reranker from AWS Bedrock.
-The reranker can be switched in the script by importing and setting a different reranker.
+The scripts run with **no reranker** (`IdentityReranker`, which preserves
+retrieval order without reordering). Declarative memory still requires a
+reranker object, so to use a real one, import and construct a different
+`Reranker` in `longmemeval_ingest.py` / `longmemeval_search.py`.
 
 Set the following environment variables:
-
-- `AWS_ACCESS_KEY_ID`: for reranker
-
-- `AWS_SECRET_ACCESS_KEY`: for reranker
 
 - `NEO4J_URI`: URI for the Neo4j database
 
@@ -120,15 +119,26 @@ python longmemeval_ingest.py --data-path path/to/longmemeval_s_cleaned.json
 
 ### Step 2: Query the Memory and Generate Responses to Questions
 
-```sh
-python longmemeval_search.py --data-path path/to/longmemeval_s_cleaned.json --target-path search.json
-```
-
-It may be useful to direct the stdout output to a file e.g.
+Search is vector-only by default. Add `--use-fts` to run **hybrid Vector + FTS**
+retrieval (fused via Reciprocal Rank Fusion). To A/B the two, run it twice with
+different `--target-path` files:
 
 ```sh
-python longmemeval_search.py --data-path path/to/longmemeval_s_cleaned.json --target-path search.json > search.out
+# Vector-only baseline
+python longmemeval_search.py --data-path path/to/longmemeval_m_cleaned.json --target-path search_vector.json
+
+# Hybrid Vector + FTS (RRF)
+python longmemeval_search.py --data-path path/to/longmemeval_m_cleaned.json --target-path search_fts.json --use-fts
 ```
+
+> **Before the `--use-fts` run**, create the full-text indexes on the ingested
+> Derivative collections (ingestion does not create them reliably):
+> ```sh
+> python backfill_fts_indexes.py
+> ```
+> It is idempotent and safe to run once after ingestion.
+
+It may be useful to direct stdout to a file, e.g. `... --target-path search_fts.json --use-fts > search_fts.out`.
 
 ### Step 3: Evaluate the Responses
 

@@ -4,22 +4,20 @@ import os
 from datetime import datetime
 from uuid import uuid4
 
-import boto3
 import neo4j
 import openai
 from dotenv import load_dotenv
 from longmemeval_models import (
     LongMemEvalItem,
-    load_longmemeval_dataset,
+    iter_longmemeval_dataset,
 )
+from memmachine_server.common.cache.llm_cache_store import LLMCacheStore
+from memmachine_server.common.embedder.caching_embedder import CachingEmbedder
 from memmachine_server.common.embedder.openai_embedder import (
     OpenAIEmbedder,
     OpenAIEmbedderParams,
 )
-from memmachine_server.common.reranker.amazon_bedrock_reranker import (
-    AmazonBedrockReranker,
-    AmazonBedrockRerankerParams,
-)
+from memmachine_server.common.reranker.identity_reranker import IdentityReranker
 from memmachine_server.common.utils import async_with
 from memmachine_server.common.vector_graph_store.neo4j_vector_graph_store import (
     Neo4jVectorGraphStore,
@@ -33,18 +31,83 @@ from memmachine_server.episodic_memory.declarative_memory import (
 )
 
 
-async def main():
+async def main():  # noqa: C901 - linear setup + ingest loop; complexity is inherent
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--data-path", required=True, help="Path to the data file")
-
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Ingest only the FIRST N questions. NOTE: the dataset is grouped by "
+        "question_type, so first-N is all one type — smoke tests only. For a "
+        "representative subset use --sample. Use the same value for search.",
+    )
+    parser.add_argument(
+        "--sample",
+        type=int,
+        default=None,
+        help="Ingest N evenly-spaced questions spanning all question types "
+        "(representative subset). Use the same --sample for the search step.",
+    )
+    parser.add_argument(
+        "--session-concurrency",
+        type=int,
+        default=4,
+        help="Max sessions embedded/written concurrently per question "
+        "(lower = less peak memory)",
+    )
+    parser.add_argument(
+        "--no-sentence-chunking",
+        action="store_true",
+        help="Disable per-sentence chunking (~5x less memory/disk, ~1-2%% lower scores)",
+    )
+    parser.add_argument(
+        "--embedding-cache",
+        default=None,
+        help="Path to an LLM cache SQLite file (e.g. ../../llm_cache.db) to cache "
+        "embeddings across runs. Omit to disable. Re-ingesting the same content "
+        "then skips the embedding provider calls (cache hits).",
+    )
+    parser.add_argument(
+        "--max-question-attempts",
+        type=int,
+        default=3,
+        help="Retry each question up to N times on transient failures (e.g. an "
+        "embedding 404) before skipping it, so one blip can't abort a long run.",
+    )
+    parser.add_argument(
+        "--embedding-model",
+        default="text-embedding-3-small",
+        help="Embedding model id (e.g. Qwen/Qwen3-Embedding-4B). Must match "
+        "between ingest and search.",
+    )
+    parser.add_argument(
+        "--embedding-dimensions",
+        type=int,
+        default=1536,
+        help="Embedding dimensionality (e.g. 2560 for Qwen3-Embedding-4B). Must "
+        "match between ingest and search.",
+    )
+    parser.add_argument(
+        "--embedding-base-url",
+        default=None,
+        help="OpenAI-compatible base URL for the embedding provider (e.g. "
+        "https://api.deepinfra.com/v1/openai). Omit to use OpenAI. The API key "
+        "comes from EMBEDDING_API_KEY, falling back to OPENAI_API_KEY.",
+    )
+    parser.add_argument(
+        "--no-vector-index",
+        action="store_true",
+        help="Skip per-collection vector (HNSW) index creation. Search then uses "
+        "exact brute-force similarity over each (bounded) per-question collection "
+        "— the same path collections below the threshold already use. Avoids the "
+        "on-heap growth from hundreds of vector indexes under sentence chunking "
+        "(which GC-thrashed Neo4j at scale); recommended for chunked full runs.",
+    )
     args = parser.parse_args()
 
     data_path = args.data_path
-
-    all_questions = load_longmemeval_dataset(data_path)
-    num_questions = len(all_questions)
-    print(f"{num_questions} total questions")
 
     neo4j_driver = neo4j.AsyncGraphDatabase.driver(
         uri=os.getenv("NEO4J_URI"),
@@ -54,42 +117,63 @@ async def main():
         ),
     )
 
+    # This harness ingests one collection per question; with sentence chunking
+    # those collections cross the 10k threshold and each builds a 1536-dim HNSW
+    # vector index whose on-heap state accumulates with question count and
+    # GC-thrashes Neo4j (2G heap died at q59, 8G at q248). --no-vector-index
+    # sets the threshold out of reach so none are built; search_similar_nodes
+    # then falls back to exact brute-force cosine over each bounded collection.
+    vector_index_threshold = 1_000_000_000 if args.no_vector_index else 10000
     vector_graph_store = Neo4jVectorGraphStore(
         Neo4jVectorGraphStoreParams(
             driver=neo4j_driver,
             range_index_creation_threshold=10000,
-            vector_index_creation_threshold=10000,
+            vector_index_creation_threshold=vector_index_threshold,
         )
     )
 
-    openai_client = openai.AsyncOpenAI(
-        api_key=os.getenv("OPENAI_API_KEY"),
+    # The embedder may point at a different OpenAI-compatible provider than
+    # OpenAI (e.g. a hosted Qwen embedder), with its own key (EMBEDDING_API_KEY,
+    # falling back to OPENAI_API_KEY). base_url=None uses OpenAI. A high
+    # max_retries lets the SDK ride out transient provider overload (e.g.
+    # DeepInfra 429 "engine_overloaded" while it autoscales) with exponential
+    # backoff, since the embedder itself is invoked with max_attempts=1.
+    embedding_client = openai.AsyncOpenAI(
+        api_key=os.getenv("EMBEDDING_API_KEY") or os.getenv("OPENAI_API_KEY"),
+        base_url=args.embedding_base_url,
+        max_retries=8,
     )
 
     embedder = OpenAIEmbedder(
         OpenAIEmbedderParams(
-            client=openai_client,
-            model="text-embedding-3-small",
-            dimensions=1536,
+            client=embedding_client,
+            model=args.embedding_model,
+            dimensions=args.embedding_dimensions,
             max_input_length=2048,
         )
     )
 
-    region = "us-west-2"
-    aws_client = boto3.client(
-        "bedrock-agent-runtime",
-        region_name=region,
-        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-    )
-
-    reranker = AmazonBedrockReranker(
-        AmazonBedrockRerankerParams(
-            client=aws_client,
-            region=region,
-            model_id="cohere.rerank-v3-5:0",
+    # Optionally wrap the embedder with the persistent LLM cache so identical
+    # inputs are served from disk instead of re-calling the provider. The
+    # signature mirrors this embedder's config, so cache hits return vectors
+    # computed the same way; to share with a running server's cache, its
+    # `openai_embedder` config must match these fields exactly.
+    cache_store: LLMCacheStore | None = None
+    if args.embedding_cache:
+        cache_store = LLMCacheStore(args.embedding_cache)
+        await cache_store.startup()
+        signature = LLMCacheStore.model_signature(
+            provider="openai",
+            model=args.embedding_model,
+            dimensions=args.embedding_dimensions,
+            max_input_length=2048,
         )
-    )
+        embedder = CachingEmbedder(embedder, signature, cache_store)
+        print(f"Embedding cache enabled: {args.embedding_cache}", flush=True)
+
+    # "No reranker": IdentityReranker preserves order (declarative memory still
+    # requires a reranker object; this one does no reordering).
+    reranker = IdentityReranker()
 
     async def process_conversation(question: LongMemEvalItem):
         group_id = question.question_id
@@ -101,7 +185,7 @@ async def main():
                 vector_graph_store=vector_graph_store,
                 embedder=embedder,
                 reranker=reranker,
-                message_sentence_chunking=True,
+                message_sentence_chunking=not args.no_sentence_chunking,
             )
         )
 
@@ -127,16 +211,56 @@ async def main():
                     )
                 )
 
-            session_tasks.append(memory.add_episodes(episodes=episodes))
+            # Bound concurrency so only N sessions' chunks+embeddings are in
+            # flight at once, instead of the whole haystack simultaneously.
+            session_tasks.append(
+                async_with(session_semaphore, memory.add_episodes(episodes=episodes))
+            )
 
         await asyncio.gather(*session_tasks)
 
-    semaphore = asyncio.Semaphore(1)
-    tasks = [
-        async_with(semaphore, process_conversation(question))
-        for question in all_questions
-    ]
-    await asyncio.gather(*tasks)
+    session_semaphore = asyncio.Semaphore(args.session_concurrency)
+
+    async def delete_question_data(question_id: str) -> None:
+        # Drop any partial Episode/Derivative collections for one question so a
+        # retry starts clean (each run mints fresh uids, so leftovers would
+        # duplicate) and a skipped question leaves no partial haystack behind.
+        for prefix in ("Episode_", "Derivative_"):
+            label = Neo4jVectorGraphStore._sanitize_name(f"{prefix}{question_id}")  # noqa: SLF001
+            await neo4j_driver.execute_query(f"MATCH (n:`{label}`) DETACH DELETE n")
+
+    # Stream one question at a time so the multi-GB dataset is never fully
+    # resident (json.load on the ~2.6 GB M split alone exhausts RAM). Questions
+    # are ingested sequentially; the session semaphore bounds concurrency
+    # within each question. Each question is retried on transient failures
+    # (e.g. an anomalous embedding 404) so one blip can't abort the whole run.
+    count = 0
+    skipped: list[str] = []
+    for question in iter_longmemeval_dataset(
+        data_path, limit=args.limit, sample=args.sample
+    ):
+        for attempt in range(1, args.max_question_attempts + 1):
+            try:
+                await process_conversation(question)
+                break
+            except Exception as exc:
+                print(
+                    f"[warn] question {question.question_id} attempt "
+                    f"{attempt}/{args.max_question_attempts} failed: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                await delete_question_data(question.question_id)
+                if attempt == args.max_question_attempts:
+                    skipped.append(question.question_id)
+        count += 1
+        print(f"processed {count} questions (last: {question.question_id})", flush=True)
+    print(f"Done: {count} processed, {len(skipped)} skipped after retries")
+    if skipped:
+        print(f"SKIPPED question_ids: {skipped}", flush=True)
+
+    if cache_store is not None:
+        await cache_store.close()
 
 
 if __name__ == "__main__":
