@@ -355,9 +355,17 @@ class LongTermMemory:
             ),
         )
 
+        # The vector leg comes back in chronological order (DeclarativeMemory
+        # sorts its output by timestamp), but RRF ranks by list position, so
+        # restore relevance order first. The sort is stable, so expanded-context
+        # episodes that share their nucleus's score stay chronological.
+        vector_ranked = sorted(
+            vector_results, key=lambda scored: scored[0], reverse=True
+        )
+
         # Fuse the two ranked lists. Vector is passed first so its (richer)
         # Episode instance wins for a uid present in both legs.
-        fused = LongTermMemory._rrf_fuse([vector_results, fts_results])
+        fused = LongTermMemory._rrf_fuse([vector_ranked, fts_results])
 
         if score_threshold is not None:
             fused = [
@@ -422,13 +430,21 @@ class LongTermMemory:
         ``1 / (k + rank)`` (1-based rank). Deduplicates by ``Episode.uid``,
         keeping the first Episode instance seen for a uid — pass the
         highest-quality list first. Input list ordering (not the input scores)
-        is what drives fusion. Returns (fused_score, Episode) ordered by fused
-        score descending.
+        is what drives fusion. Within a list, only a uid's first (best)
+        occurrence is ranked — FTS returns one row per matching derivative, so
+        a sentence-chunked episode can appear several times. Returns
+        (fused_score, Episode) ordered by fused score descending.
         """
         fused_scores: dict[str, float] = {}
         episodes_by_uid: dict[str, Episode] = {}
         for ranked_list in ranked_lists:
-            for rank, (_, episode) in enumerate(ranked_list, start=1):
+            seen_in_list: set[str] = set()
+            unique_episodes: list[Episode] = []
+            for _, episode in ranked_list:
+                if episode.uid not in seen_in_list:
+                    seen_in_list.add(episode.uid)
+                    unique_episodes.append(episode)
+            for rank, episode in enumerate(unique_episodes, start=1):
                 fused_scores[episode.uid] = fused_scores.get(episode.uid, 0.0) + 1.0 / (
                     k + rank
                 )

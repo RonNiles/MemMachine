@@ -4,7 +4,10 @@ Pure-logic tests — no Neo4j/Docker required, so this module is intentionally
 NOT marked `integration`.
 """
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 from memmachine_server.common.episode_store import Episode
 from memmachine_server.episodic_memory.long_term_memory.long_term_memory import (
@@ -14,12 +17,12 @@ from memmachine_server.episodic_memory.long_term_memory.long_term_memory import 
 _NOW = datetime(2026, 1, 1, tzinfo=UTC)
 
 
-def _ep(uid: str, content: str = "") -> Episode:
+def _ep(uid: str, content: str = "", created_at: datetime = _NOW) -> Episode:
     return Episode(
         uid=uid,
         content=content or uid,
         session_key="s",
-        created_at=_NOW,
+        created_at=created_at,
         producer_id="p",
         producer_role="user",
     )
@@ -82,3 +85,40 @@ def test_rrf_fuse_respects_k_parameter():
 def test_rrf_fuse_empty_input():
     assert LongTermMemory._rrf_fuse([]) == []
     assert LongTermMemory._rrf_fuse([[], []]) == []
+
+
+def test_rrf_fuse_ranks_only_first_occurrence_within_a_list():
+    # FTS returns one row per matching derivative, so a sentence-chunked episode
+    # can repeat; it must be ranked once, and later items must not be pushed down.
+    fts = [(9.0, _ep("A")), (8.0, _ep("A")), (7.0, _ep("B")), (6.0, _ep("A"))]
+
+    fused = LongTermMemory._rrf_fuse([fts])
+    scores = {ep.uid: score for score, ep in fused}
+    assert scores == {"A": _rrf(1), "B": _rrf(2)}
+
+
+@pytest.mark.asyncio
+async def test_hybrid_rrf_ranks_vector_leg_by_score_not_timestamp():
+    # DeclarativeMemory returns the vector leg in chronological order. The most
+    # relevant hit (highest score) is the NEWEST, so position-as-rank would
+    # wrongly give the oldest episode rank 1.
+    oldest = _ep("oldest", created_at=_NOW)
+    middle = _ep("middle", created_at=_NOW + timedelta(days=1))
+    newest = _ep("newest", created_at=_NOW + timedelta(days=2))
+    chronological_vector = [(1.0, oldest), (2.0, middle), (3.0, newest)]
+
+    ltm = object.__new__(LongTermMemory)
+    ltm._declarative_memory = MagicMock()
+    ltm._search_scored_declarative = AsyncMock(return_value=chronological_vector)
+    ltm._search_fts = AsyncMock(return_value=[])
+
+    fused = await ltm._search_scored_hybrid(
+        "q",
+        num_episodes_limit=10,
+        expand_context=0,
+        score_threshold=None,
+        property_filter=None,
+    )
+
+    assert [ep.uid for _, ep in fused] == ["newest", "middle", "oldest"]
+    assert fused[0][0] == _rrf(1)
