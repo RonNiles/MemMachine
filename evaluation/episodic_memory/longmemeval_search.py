@@ -230,13 +230,13 @@ async def main():
 
         total_start = time.monotonic()
         memory_start = time.monotonic()
-        # use_fts=False -> vector-only; use_fts=True -> Vector + FTS fused via RRF.
+        # use_fts=False -> vector-only; "rrf" / "append" -> Vector + FTS hybrid
+        # fused by that method.
         scored = await long_term_memory.search_scored(
             query=search_query,
             num_episodes_limit=100,
             expand_context=0,
-            use_fts=args.use_fts,
-            fusion=args.fusion,
+            use_fts=args.fusion if args.use_fts else False,
         )
         memory_end = time.monotonic()
         memory_latency = memory_end - memory_start
