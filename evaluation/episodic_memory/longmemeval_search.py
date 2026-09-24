@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import time
 
 import neo4j
@@ -19,7 +20,15 @@ from memmachine_server.common.embedder.openai_embedder import (
     OpenAIEmbedderParams,
 )
 from memmachine_server.common.episode_store.episode_model import episodes_to_string
+from memmachine_server.common.reranker.bm25_reranker import (
+    BM25Reranker,
+    BM25RerankerParams,
+)
 from memmachine_server.common.reranker.identity_reranker import IdentityReranker
+from memmachine_server.common.reranker.rrf_hybrid_reranker import (
+    RRFHybridReranker,
+    RRFHybridRerankerParams,
+)
 from memmachine_server.common.utils import async_with
 from memmachine_server.common.vector_graph_store.neo4j_vector_graph_store import (
     Neo4jVectorGraphStore,
@@ -52,6 +61,33 @@ Question: {question}
 """
 
 
+def build_reranker(name: str):
+    """Return the episode reranker for --reranker."""
+    if name == "identity":
+        # "No reranker": IdentityReranker preserves retrieval order.
+        return IdentityReranker()
+
+    # "rrf-bm25": RRF of identity + BM25, mirroring the server's sample-config
+    # default reranker and its "default" BM25 tokenizer (reranker_manager.py).
+    from nltk import word_tokenize
+    from nltk.corpus import stopwords
+
+    stop_words = set(stopwords.words("english"))
+
+    def tokenize(text: str) -> list[str]:
+        words = word_tokenize(re.sub(r"\W+", " ", text).lower(), "english")
+        return [word for word in words if word and word not in stop_words]
+
+    return RRFHybridReranker(
+        RRFHybridRerankerParams(
+            rerankers=[
+                IdentityReranker(),
+                BM25Reranker(BM25RerankerParams(tokenize=tokenize)),
+            ]
+        )
+    )
+
+
 async def main():
     parser = argparse.ArgumentParser()
 
@@ -73,6 +109,32 @@ async def main():
         help="Hybrid fusion strategy when --use-fts is set: 'rrf' (Reciprocal "
         "Rank Fusion) or 'append' (original PR method: append FTS top-10 to the "
         "vector list). Ignored without --use-fts.",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=100,
+        help="Episodes retrieved per question (num_episodes_limit). Append-mode "
+        "hybrid returns up to top-k + --append-n.",
+    )
+    parser.add_argument(
+        "--append-n",
+        type=int,
+        default=10,
+        help="FTS results appended in --fusion append mode.",
+    )
+    parser.add_argument(
+        "--reranker",
+        choices=["identity", "rrf-bm25"],
+        default="identity",
+        help="'identity' (no reranking) or 'rrf-bm25' (RRF of identity + BM25, "
+        "the server's sample-config default reranker).",
+    )
+    parser.add_argument(
+        "--retrieval-only",
+        action="store_true",
+        help="Skip answer generation; record retrieved episode uids only (for "
+        "longmemeval_recall.py).",
     )
     parser.add_argument(
         "--limit",
@@ -179,8 +241,7 @@ async def main():
         embedder = CachingEmbedder(embedder, signature, cache_store)
         print(f"Embedding cache enabled: {args.embedding_cache}", flush=True)
 
-    # "No reranker": IdentityReranker preserves retrieval order without reordering.
-    reranker = IdentityReranker()
+    reranker = build_reranker(args.reranker)
 
     async def qa_eval(
         memories,
@@ -234,22 +295,26 @@ async def main():
         # fused by that method.
         scored = await long_term_memory.search_scored(
             query=search_query,
-            num_episodes_limit=100,
+            num_episodes_limit=args.top_k,
             expand_context=0,
             use_fts=args.fusion if args.use_fts else False,
+            append_n=args.append_n,
         )
         memory_end = time.monotonic()
         memory_latency = memory_end - memory_start
 
         formatted_context = episodes_to_string([episode for _, episode in scored])
 
-        response = await qa_eval(
-            formatted_context,
-            get_datetime_from_timestamp(question.question_date).strftime(
-                "%A, %B %d, %Y at %I:%M %p"
-            ),
-            question.question,
-        )
+        if args.retrieval_only:
+            response = {"response": "", "latency": 0.0}
+        else:
+            response = await qa_eval(
+                formatted_context,
+                get_datetime_from_timestamp(question.question_date).strftime(
+                    "%A, %B %d, %Y at %I:%M %p"
+                ),
+                question.question,
+            )
         total_end = time.monotonic()
         total_latency = total_end - total_start
 
@@ -278,6 +343,7 @@ async def main():
             "memory_latency": memory_latency,
             "llm_latency": response["latency"],
             "episodes_text": formatted_context,
+            "retrieved_uids": [episode.uid for _, episode in scored],
         }
 
     semaphore = asyncio.Semaphore(5)

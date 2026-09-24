@@ -2,7 +2,6 @@ import argparse
 import asyncio
 import os
 from datetime import datetime
-from uuid import uuid4
 
 import neo4j
 import openai
@@ -17,6 +16,10 @@ from memmachine_server.common.embedder.openai_embedder import (
     OpenAIEmbedder,
     OpenAIEmbedderParams,
 )
+from memmachine_server.common.episode_store.episode_model import (
+    ContentType as EpisodeContentType,
+)
+from memmachine_server.common.episode_store.episode_model import EpisodeType
 from memmachine_server.common.reranker.identity_reranker import IdentityReranker
 from memmachine_server.common.utils import async_with
 from memmachine_server.common.vector_graph_store.neo4j_vector_graph_store import (
@@ -105,6 +108,14 @@ async def main():  # noqa: C901 - linear setup + ingest loop; complexity is inhe
         "on-heap growth from hundreds of vector indexes under sentence chunking "
         "(which GC-thrashed Neo4j at scale); recommended for chunked full runs.",
     )
+    parser.add_argument(
+        "--index-threshold",
+        type=int,
+        default=10000,
+        help="Collection size at which range (+FTS) and vector indexes are "
+        "created. 1000 matches the Neo4jVectorGraphStore default a server would "
+        "use; --no-vector-index still suppresses the vector index.",
+    )
     args = parser.parse_args()
 
     data_path = args.data_path
@@ -123,11 +134,13 @@ async def main():  # noqa: C901 - linear setup + ingest loop; complexity is inhe
     # GC-thrashes Neo4j (2G heap died at q59, 8G at q248). --no-vector-index
     # sets the threshold out of reach so none are built; search_similar_nodes
     # then falls back to exact brute-force cosine over each bounded collection.
-    vector_index_threshold = 1_000_000_000 if args.no_vector_index else 10000
+    vector_index_threshold = (
+        1_000_000_000 if args.no_vector_index else args.index_threshold
+    )
     vector_graph_store = Neo4jVectorGraphStore(
         Neo4jVectorGraphStoreParams(
             driver=neo4j_driver,
-            range_index_creation_threshold=10000,
+            range_index_creation_threshold=args.index_threshold,
             vector_index_creation_threshold=vector_index_threshold,
         )
     )
@@ -198,11 +211,20 @@ async def main():  # noqa: C901 - linear setup + ingest loop; complexity is inhe
                 timestamp = datetime.fromisoformat(turn.timestamp)
                 episodes.append(
                     Episode(
-                        uid=str(uuid4()),
+                        # Deterministic "<question>:<session>:<turn>" uid so
+                        # retrieval recall can be scored from uids alone (FTS
+                        # hits carry no user_metadata).
+                        uid=f"{group_id}:{session_id}:{turn.index}",
                         timestamp=timestamp,
                         source="Assistant" if turn.role == "assistant" else "User",
                         content_type=ContentType.MESSAGE,
                         content=turn.content.strip(),
+                        # Properties the server's LongTermMemory writes and
+                        # requires when it reads episodes back (search_scored).
+                        filterable_properties={
+                            "episode_type": EpisodeType.MESSAGE.value,
+                            "content_type": EpisodeContentType.STRING.value,
+                        },
                         user_metadata={
                             "longmemeval_session_id": session_id,
                             "has_answer": turn.has_answer,
