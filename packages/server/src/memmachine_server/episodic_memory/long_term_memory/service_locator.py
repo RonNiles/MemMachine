@@ -78,8 +78,8 @@ async def _declarative_params(
     vector_graph_store = await resource_manager.get_vector_graph_store(
         config.vector_graph_store,
     )
-    embedder = await resource_manager.get_embedder(config.embedder, validate=True)
-    reranker = await resource_manager.get_reranker(config.reranker, validate=True)
+    embedder = await resource_manager.get_embedder(config.embedder)
+    reranker = await resource_manager.get_reranker(config.reranker)
     return DeclarativeBackendParams(
         session_id=config.session_id,
         vector_graph_store=vector_graph_store,
@@ -95,9 +95,9 @@ async def _event_params(
 ) -> EventBackendParams:
     vector_store = await resource_manager.get_vector_store(config.vector_store)
     segment_store = await resource_manager.get_segment_store(config.segment_store)
-    embedder = await resource_manager.get_embedder(config.embedder, validate=True)
+    embedder = await resource_manager.get_embedder(config.embedder)
     reranker = (
-        await resource_manager.get_reranker(config.reranker, validate=True)
+        await resource_manager.get_reranker(config.reranker)
         if config.reranker is not None
         else None
     )
